@@ -1,0 +1,9 @@
+flask
+google-cloud-discoveryengine
+gunicorn
+flask-cors
+google-cloud-bigquery
+Flask-Limiter
+google-cloud-aiplatform>=1.65.0
+google-cloud-discoveryengine
+rapidfuzz==3.14.2
