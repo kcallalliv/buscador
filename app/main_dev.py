@@ -1,4 +1,5 @@
 # app/main_dev.py
+import requests
 import datetime
 import json
 import logging
@@ -40,6 +41,57 @@ _gemini_genconf = GenerationConfig(
     response_mime_type="application/json"
 )
 
+CLAROVIDEO_MOVIES_API_URL = os.environ.get(
+    "CLAROVIDEO_MOVIES_API_URL",
+    "https://clarovideo-movies-api-1079186964678.us-central1.run.app/v1/clarovideo/peliculas/search"
+)
+
+TELCO_BLOCK_WORDS = [
+    "chip","portabilidad","recarga","plan","planes","roaming","internet","datos","ilimitado",
+    "factura","deuda","pago","pagos","linea","línea","numero","número",
+    "hogar","fibra","wifi","router","modem","módem","instalacion","instalación",
+    "tv","cable","claro tv","atencion","atención","soporte","reclamo","reclamos",
+    "servicio","servicios","migrar","renovar","renovacion","renovación"
+]
+
+DEVICE_BLOCK = {
+    "iphone","apple","samsung","xiaomi","huawei","motorola","oppo","vivo",
+    "redmi","realme","honor","nokia","sony","galaxy","pixel"
+}
+
+def looks_like_title(q: str) -> bool:
+    ql = (q or "").strip().lower()
+    if len(ql) < 2 or len(ql) > 60:
+        return False
+    if " " in ql and len(ql.split()) > 8:
+        return False
+    if any(w in ql for w in TELCO_BLOCK_WORDS):
+        return False
+    if ql in DEVICE_BLOCK or any(w in ql for w in DEVICE_BLOCK):
+        return False
+    return True
+
+
+def try_movies_first(normalized_query: str) -> dict | None:
+    if not looks_like_title(normalized_query):
+        return None
+
+    try:
+        r = requests.post(
+            CLAROVIDEO_MOVIES_API_URL,
+            json={"query": normalized_query},
+            timeout=3
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        if data.get("status") != "Found" or not data.get("listado"):
+            return None
+
+        return data
+    except Exception:
+        return None
+
 # ------------------ BQ ------------------
 bq_client = bigquery.Client()
 BQ_TABLE_PRODUCTS = "prd-claro-mktg-data-storage.tienda_claro.productos"
@@ -54,7 +106,33 @@ CORS(dev_bp, resources={r"/dev/*": {"origins": [
     "https://search-test-1079186964678.us-central1.run.app",
 ]}})
 
+def call_clarovideo_movies_api(normalized_query: str) -> dict:
+    payload = {"query": normalized_query}
+    r = requests.post(
+        CLAROVIDEO_MOVIES_API_URL,
+        json=payload,
+        timeout=10,
+        headers={"Content-Type": "application/json"},
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 # ------------------ Helpers Vertex ------------------
+
+def title_is_clarovideo_disfruta(respuesta: dict) -> bool:
+    titulo = (respuesta.get("titulo") or "").strip().lower()
+    return titulo.startswith("claro video: disfruta de")
+
+def description_is_clarovideo_disfruta(respuesta: dict) -> bool:
+    titulo = (respuesta.get("titulo") or "").lower()
+    return "y mucho más con claro video" in titulo
+
+def description_is_clarovideo_genero(respuesta: dict) -> bool:
+    titulo = (respuesta.get("titulo") or "").lower()
+    return "películas " in titulo
+
+
 def call_gemini_json(*, system_prompt: str, user_input: str, timeout: int = 15) -> dict:
     resp = _gemini_model.generate_content(
         [
@@ -78,7 +156,6 @@ ROMAN_MAP = {
 }
 
 def roman_to_arabic(s: str) -> str:
-    # Reemplazos conservadores (palabra completa)
     out = s
     for r, a in ROMAN_MAP.items():
         out = re.sub(rf"\b{r}\b", a, out)
@@ -137,8 +214,6 @@ BRAND_HINTS = {
     "zte","tcl","alcatel","sony","asus","lenovo","infinix","tecno","nothing","meizu","umidigi","doogee","blackview","blu","fairphone","cat"
 }
 
-# Stoplist global para leaks cuando brand_lock está activo
-# Términos de otras marcas que NO deben aparecer cuando hay brand_lock
 OTHER_BRAND_TERMS = {
     "apple":   ["galaxy","samsung","xiaomi","redmi","poco","motorola","huawei","honor","oppo","realme","vivo","pixel","google","tecno","infinix","lenovo","zte","tcl","nokia"],
     "samsung": ["iphone","apple","xiaomi","redmi","poco","motorola","huawei","honor","oppo","realme","vivo","pixel","google","tecno","infinix","lenovo","zte","tcl","nokia"],
@@ -170,7 +245,6 @@ STORE_SIGNALS = {
     "plan hogar","plan negocios","negocios","empresas","fijos","telefonia 5000","telefonía 5000",
 }
 
-# Modelos
 PHONE_MODEL_PATTERNS = [
     re.compile(r"\biphone\s?(?:se|[0-9]{1,2})(?:\s?(?:pro\s?max|pro|plus|mini|ultra))?\b"),
     re.compile(r"\bi\s*phone\b"),
@@ -218,85 +292,53 @@ MOVIE_HINTS = {
     "mario","sonic","mission impossible","john wick","predator","alien","terminator"
 }
 
+PLAN_HINTS = {
+    "plan", "planes", "postpago", "prepago", "pospago", "linea nueva", "línea nueva", "portabilidad", "renovacion", "renovación",
+    "chip", "sim card", "tarjeta sim"
+}
+
+def _match_any(patterns, text: str) -> bool:
+    return any(p.search(text) for p in patterns)
+
+# --- 1. OPTIMIZACIÓN DE CLARO VIDEO ---
 def search_claro_video_catalog(
     normalized_query: str,
-    max_main: int = 8,
-    max_related: int = 12,
+    max_main: int = 4,
+    max_related: int = 5,
 ):
-    """
-    Busca en el catálogo de Claro video usando BigQuery, y devuelve:
-      - main_movies: lista de películas principales (todas las coincidencias fuertes)
-      - related_movies: lista de películas relacionadas para rellenar
-
-    Enfoque robusto:
-      - NO filtramos por términos en el SQL (evitamos perdernos títulos raros).
-      - Traemos un subconjunto grande del catálogo (LIMIT).
-      - Ordenamos por similitud (rapidfuzz.WRatio) entre la query y:
-          * title
-          * title_original
-          * title_uri (slug con guiones reemplazados por espacios)
-    """
-
     nq = normalize_query_local(normalized_query)
     nq_base = strip_accents((nq or "").lower()).strip()
     if not nq_base:
         return [], []
 
-    # 1) Trae un subconjunto amplio del catálogo
+    tokens = [re.escape(t) for t in nq_base.split() if len(t) > 2]
+    if not tokens:
+         regex_filter = r".+" 
+    else:
+        regex_filter = "|".join(tokens)
+
     sql = f"""
     SELECT
-      id,
-      section,
-      title,
-      title_original,
-      year,
-      duration,
-      description,
-      description_large,
-      rating_code,
-      title_uri,
-      url,
-      image_small,
-      image_medium,
-      image_large
+      id, section, title, title_original, year, duration,
+      description, description_large, rating_code, title_uri,
+      url, image_small, image_medium, image_large
     FROM `{BQ_TABLE_CLAROVIDEO}`
-    -- Si tienes columna para tipo de contenido, aquí puedes limitar solo películas:
-    -- WHERE LOWER(IFNULL(section, '')) = 'pelicula'
-    LIMIT 2000
+    WHERE REGEXP_CONTAINS(LOWER(CONCAT(IFNULL(title,''), ' ', IFNULL(title_original,''))), @regex_filter)
+    LIMIT 200
     """
 
     try:
-        rows = list(bq_client.query(sql).result())
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("regex_filter", "STRING", regex_filter),
+            ]
+        )
+        rows = list(bq_client.query(sql, job_config=job_config).result())
     except Exception as e:
         logger.exception("Error consultando catálogo Claro video", exc_info=e)
         return [], []
 
     if not rows:
-        return [], []
-
-    # 2) Fuzzy matching sobre título, título original y slug
-    scored = []
-    for row in rows:
-        title = strip_accents((row.title or "").lower())
-        title_orig = strip_accents((row.title_original or "").lower())
-        slug = strip_accents(((row.title_uri or "") or "").replace("-", " ").lower())
-
-        s1 = fuzz.WRatio(nq_base, title) if title else 0
-        s2 = fuzz.WRatio(nq_base, title_orig) if title_orig else 0
-        s3 = fuzz.WRatio(nq_base, slug) if slug else 0
-
-        score = max(s1, s2, s3)
-        scored.append((score, row, title, title_orig, slug))
-
-    if not scored:
-        return [], []
-
-    # Ordenar por mejor score
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    best_score = scored[0][0]
-    # Si el mejor score es muy bajo, consideramos que no hay match razonable
-    if best_score < 40:
         return [], []
 
     def row_to_movie(r) -> dict:
@@ -317,74 +359,134 @@ def search_claro_video_catalog(
             "image_large": r.image_large,
         }
 
+    scored = []
+    for row in rows:
+        title = strip_accents((row.title or "").lower())
+        title_orig = strip_accents((row.title_original or "").lower())
+        slug = strip_accents(((row.title_uri or "") or "").replace("-", " ").lower())
+
+        s1 = fuzz.WRatio(nq_base, title) if title else 0
+        s2 = fuzz.WRatio(nq_base, title_orig) if title_orig else 0
+        s3 = fuzz.WRatio(nq_base, slug) if slug else 0
+
+        score = max(s1, s2, s3)
+        scored.append((score, row, title, title_orig, slug))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    if not scored or scored[0][0] < 40:
+        return [], []
+
     main_movies: List[dict] = []
     related_movies: List[dict] = []
 
-    # 3) MAIN: coincidencias directas (query como substring) con buen score
     for score, row, title, title_orig, slug in scored:
-        if score < 40:
-            break
-
-        if (
-            nq_base in title
-            or nq_base in title_orig
-            or nq_base in slug
-        ):
+        if score < 40: break
+        if (nq_base in title or nq_base in title_orig or nq_base in slug):
             main_movies.append(row_to_movie(row))
+        if len(main_movies) >= max_main: break
 
-        if len(main_movies) >= max_main:
-            break
-
-    # 4) Si no hubo suficientes direct hits, rellenar main_movies con los mejores scores
     if not main_movies:
         for score, row, *_ in scored:
-            if score < 40:
-                break
+            if score < 40: break
             main_movies.append(row_to_movie(row))
-            if len(main_movies) >= max_main:
-                break
+            if len(main_movies) >= max_main: break
 
     used_ids = {m["id"] for m in main_movies}
 
-    # 5) RELATED: siguientes mejores que no estén en main_movies
     for score, row, *_ in scored:
-        if len(related_movies) >= max_related:
-            break
-        if row.id in used_ids:
-            continue
-        if score < 30:
-            continue
+        if len(related_movies) >= max_related: break
+        if row.id in used_ids: continue
+        if score < 30: continue
         related_movies.append(row_to_movie(row))
 
+    # Backfill para relacionados
+    if len(related_movies) < max_related and main_movies:
+        try:
+            ref_item = main_movies[0]
+            ref_section = ref_item.get("section")
+            exclude_ids = [m["id"] for m in main_movies + related_movies]
+            
+            backfill_limit = max_related - len(related_movies)
+            
+            backfill_sql = f"""
+            SELECT
+              id, section, title, title_original, year, duration,
+              description, description_large, rating_code, title_uri,
+              url, image_small, image_medium, image_large
+            FROM `{BQ_TABLE_CLAROVIDEO}`
+            WHERE id NOT IN UNNEST(@exclude_ids)
+            """
+            
+            query_params = [
+                bigquery.ArrayQueryParameter("exclude_ids", "STRING", exclude_ids),
+            ]
+
+            if ref_section:
+                backfill_sql += " AND section = @ref_section"
+                query_params.append(bigquery.ScalarQueryParameter("ref_section", "STRING", ref_section))
+            
+            backfill_sql += f" LIMIT {backfill_limit + 5}"
+
+            job_config_bf = bigquery.QueryJobConfig(query_parameters=query_params)
+            bf_rows = list(bq_client.query(backfill_sql, job_config=job_config_bf).result())
+            
+            for row in bf_rows:
+                if len(related_movies) >= max_related: break
+                related_movies.append(row_to_movie(row))
+                
+        except Exception as e:
+            logger.warning(f"Error en backfill de relacionados: {e}")
+
     return main_movies, related_movies
-
-
-PLAN_HINTS = {
-    "plan", "planes", "postpago", "prepago", "pospago", "linea nueva", "línea nueva", "portabilidad", "renovacion", "renovación",
-    "chip", "sim card", "tarjeta sim"
-}
-
-def _match_any(patterns, text: str) -> bool:
-    return any(p.search(text) for p in patterns)
 
 GEMINI_INTENT_PROMPT = """
 Eres un clasificador de consultas para el buscador de Claro Perú.
 Tu tarea: (1) corregir/estandarizar la consulta; (2) clasificarla en una categoría.
+
 Categorías:
 - "celulares": equipos/marcas/modelos de teléfonos (iphone, samsung galaxy, xiaomi/redmi/poco, motorola, huawei/honor, etc.).
 - "tienda_productos": catálogo de Tienda Claro NO celulares (routers, decodificadores, planes hogar/negocios fijos, accesorios como power bank/cargadores/audífonos/smartwatch, etc.).
-- "planes": cuando la intención es buscar planes móviles (postpago, prepago, portabilidad, renovación) o solo el chip.
-- "pelicula": cuando la intención del usuario es el nombre de una película o franquicia.
-- "general": preguntas informativas, soporte, trámites u otros no cubiertos.
+- "planes": intención de planes móviles (postpago, prepago, portabilidad, renovación) o chip.
+- "pelicula": intención de entretenimiento en Claro video: título de película O serie, franquicia/saga, personaje/animación("Bob Esponja", "Dragon Ball"), género/categoría ("películas de terror", "películas románticas"), o búsquedas típicas para ver contenido o pregunten por animales o sobre batallas.
+  Si la consulta parece de entretenimiento/streaming, responde "pelicula" aunque no sea un título exacto.
+- "general": Preguntas de soporte, trámites, preguntas informativas u otros no cubiertos como palabras inentendibles.
+
+Reglas:
+- Si la consulta contiene "pelicula de" o "peliculas de", clasifica como "pelicula" y normaliza quitando ese prefijo.
+- Si la consulta es marca/modelo de celular o términos telco (chip, plan, portabilidad, fibra, hogar, router, internet, recibo, deuda, migrar a claro), NO es "pelicula".
+
+Ejemplos (solo guía):
+- "peliculas de terror" -> {"normalized_query":"terror","category":"pelicula"}
+- "bob esponja" -> {"normalized_query":"bob esponja","category":"pelicula"}
+- "orgullo y prejuicio" -> {"normalized_query":"orgullo y prejuicio","category":"pelicula"}
+- "iphone 15 pro" -> {"normalized_query":"iphone 15 pro","category":"celulares"}
+- "plan postpago" -> {"normalized_query":"plan postpago","category":"planes"}
+
 Responde SOLO JSON:
 { "normalized_query": "<minúsculas y corregida>", "category": "celulares" | "tienda_productos" | "planes" | "pelicula" | "general" }
 """
 
+
+# --- 2. OPTIMIZACIÓN CLASIFICACIÓN (Fast-Path) ---
 def classify_with_gemini(user_query: str) -> Tuple[str, str]:
     nq_local = normalize_query_local(user_query)
+    
+    # Fast-Path
+    has_phone_model = _match_any(PHONE_MODEL_PATTERNS, nq_local)
+    if has_phone_model:
+        return nq_local, "celulares"
+
+    terms = set(nq_local.split())
+    if bool(terms & PLAN_HINTS) and not bool(terms & BRAND_HINTS):
+        return nq_local, "planes"
+        
+    if any(kw in nq_local for kw in STORE_SIGNALS) or any(kw in nq_local for kw in ACCESSORY_TERMS):
+         return nq_local, "tienda_productos"
+
     try:
         payload = {"query": user_query}
-        result = call_gemini_json(system_prompt=GEMINI_INTENT_PROMPT, user_input=json.dumps(payload))
+        result = call_gemini_json(system_prompt=GEMINI_INTENT_PROMPT, user_input=json.dumps(payload), timeout=4)
         model_norm = normalize_query_local(result.get("normalized_query") or nq_local)
         normalized = _safe_pick_normalized(model_norm, nq_local)
         category = (result.get("category") or "general").strip().lower()
@@ -392,7 +494,7 @@ def classify_with_gemini(user_query: str) -> Tuple[str, str]:
         normalized = nq_local
         category = "general"
 
-    # Overrides heurísticos
+    # Overrides finales
     has_phone_model = _match_any(PHONE_MODEL_PATTERNS, normalized)
     terms = set(normalized.split())
     has_phone_brand = bool(terms & BRAND_HINTS)
@@ -403,23 +505,13 @@ def classify_with_gemini(user_query: str) -> Tuple[str, str]:
     is_movie = any(h in normalized for h in MOVIE_HINTS)
     is_plan_query = bool(terms & PLAN_HINTS) and not (has_phone_model or has_phone_brand or has_accessory)
     
-    # Prioridad: Película > Plan > Celular > Tienda Producto > General
-    
-    if is_movie:
-        category = "pelicula"
-    elif is_plan_query and not has_phone_model:
-        category = "planes"
-    elif has_phone_model:
-        category = "celulares"
-    elif has_store or has_accessory:
-        category = "tienda_productos"
-    elif has_phone_brand and generic_phone_words:
-        category = "celulares"
-    elif has_phone_brand:
-        category = "celulares"
-    # Si detecta plan y no es un modelo específico, forzar a 'planes'
-    elif is_plan_query:
-        category = "planes"
+    if is_movie: category = "pelicula"
+    elif is_plan_query and not has_phone_model: category = "planes"
+    elif has_phone_model: category = "celulares"
+    elif has_store or has_accessory: category = "tienda_productos"
+    elif has_phone_brand and generic_phone_words: category = "celulares"
+    elif has_phone_brand: category = "celulares"
+    elif is_plan_query: category = "planes"
 
     return normalized, category
 
@@ -447,29 +539,21 @@ def _brand_terms_from_query(nq: str) -> List[str]:
 
 def _canonical_brand_from_query(nq: str) -> Optional[str]:
     s = nq.lower()
-    # Apple
-    if "iphone" in s or "apple" in s:
-        return "apple"
-    # Samsung
-    if "samsung" in s or "galaxy" in s:
-        return "samsung"
-    # Xiaomi ecosistema: redmi/poco => canonical xiaomi
-    if "xiaomi" in s or "redmi" in s or re.search(r"\bpoco\b", s):
-        return "xiaomi"
-    # Resto
-    if "huawei" in s:                 return "huawei"
+    if "iphone" in s or "apple" in s: return "apple"
+    if "samsung" in s or "galaxy" in s: return "samsung"
+    if "xiaomi" in s or "redmi" in s or re.search(r"\bpoco\b", s): return "xiaomi"
+    if "huawei" in s: return "huawei"
     if "motorola" in s or re.search(r"\bmoto\b", s): return "motorola"
     if "pixel" in s or "google" in s: return "google"
-    if "honor" in s:                  return "honor"
-    if "infinix" in s:                return "infinix"
-    if "tecno" in s:                  return "tecno"
-    if "oppo" in s:                   return "oppo"
-    if "realme" in s:                 return "realme"
-    if "vivo" in s:                   return "vivo"
-    if "lenovo" in s:                 return "lenovo"
-    if "zte" in s:                    return "zte"
+    if "honor" in s: return "honor"
+    if "infinix" in s: return "infinix"
+    if "tecno" in s: return "tecno"
+    if "oppo" in s: return "oppo"
+    if "realme" in s: return "realme"
+    if "vivo" in s: return "vivo"
+    if "lenovo" in s: return "lenovo"
+    if "zte" in s: return "zte"
     return None
-
 
 def _is_brand_only_query(nq: str) -> bool:
     if _match_any(PHONE_MODEL_PATTERNS, nq): return False
@@ -570,7 +654,7 @@ def _category_hint_from_query(nq: str) -> str:
     if "audifono" in s or "audifonos" in s or "audífono" in s or "audífonos" in s or "earbuds" in s or "airpods" in s or "earpods" in s or "auriculares" in s: return "headphones"
     return ""
 
-# ------------------ BQ: Productos (consulta general) ------------------
+# ------------------ BQ: Productos ------------------
 def search_products_bq(nq: str, prioritize_plan_79: bool):
     terms = _terms_from_query(nq)
     if not terms: return [], False, nq
@@ -591,20 +675,16 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
     elif canon == "motorola":
         brand_aliases, brand_kw = ["motorola","moto"], "moto"
     elif canon == "xiaomi":
-        # Redmi y POCO se tratan como ecosistema Xiaomi
         brand_aliases, brand_kw = ["xiaomi","redmi","poco"], "xiaomi"
     elif canon == "google":
         brand_aliases, brand_kw = ["google","pixel"], "pixel"
     elif canon in ("huawei","honor","oppo","realme","vivo","infinix","tecno","lenovo","zte","tcl","nokia"):
         brand_aliases, brand_kw = [canon], canon
 
-    brand_lock = bool(canon)  # si hay marca canónica, activamos lock
+    brand_lock = bool(canon) 
     other_terms = OTHER_BRAND_TERMS.get(canon, [])
-
-
     force_prepago = want_prepago
-
-    # Flags de variantes según la consulta
+    
     want_pro_max = 1 if re.search(r'\bpro\s*max\b', nq, re.I) else 0
     want_pro     = 1 if (re.search(r'\bpro\b', nq, re.I) and not want_pro_max) else 0
     want_ultra   = 1 if re.search(r'\bultra\b', nq, re.I) else 0
@@ -614,7 +694,6 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
     want_mini    = 1 if re.search(r'\bmini\b', nq, re.I) else 0
     want_se      = 1 if re.search(r'\bse\b', nq, re.I) else 0
 
-    # SOLUCIÓN AL ERROR DE AMBITO: Se unifican scored_stage y scored
     strict_sql = f"""
     DECLARE qnum STRING DEFAULT @qnum;
 
@@ -629,8 +708,6 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
         SAFE_CAST(NULLIF(CAST(price_con_descuento AS STRING), '') AS FLOAT64) AS price_con_descuento
       FROM `{BQ_TABLE_PRODUCTS}`
     ),
-
-    /* Guardas de marca + stoplist */
     brand_guard AS (
       SELECT * FROM base
       WHERE
@@ -648,7 +725,6 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
           )
         )
     ),
-
     filtered AS (
       SELECT * FROM brand_guard
       WHERE
@@ -665,8 +741,6 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
           LOWER(IFNULL(modality,'')) = LOWER(@explicit_mod)
         )
     ),
-
-    /* Normalización: colores y capacidad (como en TOP) */
     enriched_base AS (
       SELECT
         *,
@@ -702,34 +776,26 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
         END AS cap_hit
       FROM filtered
     ),
-
     enriched_base2 AS (
       SELECT
         enriched_base.*,
         SAFE_CAST(NULLIF(model_number_str,'') AS INT64) AS model_number
       FROM enriched_base
     ),
-
-    /* Tokens exactos/variantes */
     enriched AS (
       SELECT
         enriched_base2.*,
-        
-        -- iPhone tokens (con exclusiones para modelo base)
         IF(REGEXP_CONTAINS(tp_lc, r'\\biphone\\s*se\\b'),1,0) AS tok_iphone_se,
         IF(REGEXP_CONTAINS(tp_lc, r'\\biphone[[:space:]]*17[[:space:]]*pro[[:space:]]*max\\b'),1,0) AS tok_ip17promax,
         IF(REGEXP_CONTAINS(tp_lc, r'\\biphone[[:space:]]*17[[:space:]]*pro\\b'),1,0) AS tok_ip17pro,
         IF(REGEXP_CONTAINS(tp_lc, r'\\biphone[[:space:]]*17[[:space:]]*plus\\b'),1,0) AS tok_ip17plus,
         IF(REGEXP_CONTAINS(tp_lc, r'\\biphone[[:space:]]*17\\b') AND NOT REGEXP_CONTAINS(tp_lc, r'\\b(pro|plus|max|ultra|mini|se|lite|fe)\\b'),1,0) AS tok_ip17,
-
         IF(REGEXP_CONTAINS(tp_lc, r'\\biphone[[:space:]]*16[[:space:]]*pro[[:space:]]*max\\b'),1,0) AS tok_ip16promax,
         IF(REGEXP_CONTAINS(tp_lc, r'\\biphone[[:space:]]*16[[:space:]]*pro\\b'),1,0) AS tok_ip16pro,
         IF(REGEXP_CONTAINS(tp_lc, r'\\biphone[[:space:]]*16\\b') AND NOT REGEXP_CONTAINS(tp_lc, r'\\b(pro|plus|max|ultra|mini|se|lite|fe)\\b'),1,0) AS tok_ip16,
-
         IF(REGEXP_CONTAINS(tp_lc, r'\\biphone[[:space:]]*15\\b') AND NOT REGEXP_CONTAINS(tp_lc, r'\\b(pro|plus|max|ultra|mini|se|lite|fe)\\b'),1,0) AS tok_ip15,
         IF(REGEXP_CONTAINS(tp_lc, r'\\biphone[[:space:]]*14\\b') AND NOT REGEXP_CONTAINS(tp_lc, r'\\b(pro|plus|max|ultra|mini|se|lite|fe)\\b'),1,0) AS tok_ip14,
 
-        -- iPhone variantes
         IF(REGEXP_CONTAINS(tp_lc, r'\\bmini\\b'),1,0) AS has_mini,
         IF(REGEXP_CONTAINS(tp_lc, r'\\bpro[[:space:]]*max\\b'),1,0) AS has_pro_max,
         IF(REGEXP_CONTAINS(tp_lc, r'\\bpro\\b') AND NOT REGEXP_CONTAINS(tp_lc, r'\\bmax\\b'),1,0) AS has_pro_only,
@@ -739,17 +805,13 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
         IF(REGEXP_CONTAINS(tp_lc, r'\\bse\\b'),1,0) AS has_se,
         IF(REGEXP_CONTAINS(tp_lc, r'\\bultra\\b'),1,0) AS has_ultra,
 
-        -- Samsung S series (con exclusiones para base)
         IF(REGEXP_CONTAINS(tp_lc, r'\\bgalaxy[[:space:]]*s[[:space:]]*25[[:space:]]*ultra\\b'),1,0) AS tok_s25ultra,
         IF(REGEXP_CONTAINS(tp_lc, r'\\bgalaxy[[:space:]]*s[[:space:]]*25[[:space:]]*\\+\\b|\\bgalaxy\\s*s\\s*25\\s*plus\\b'),1,0) AS tok_s25plus,
         IF(REGEXP_CONTAINS(tp_lc, r'\\bgalaxy[[:space:]]*s[[:space:]]*25[[:space:]]*fe\\b'),1,0) AS tok_s25fe,
         IF(REGEXP_CONTAINS(tp_lc, r'\\bgalaxy[[:space:]]*s[[:space:]]*25\\b') AND NOT REGEXP_CONTAINS(tp_lc, r'\\b(ultra|plus|fe)\\b'),1,0) AS tok_s25,
-
         IF(REGEXP_CONTAINS(tp_lc, r'\\bgalaxy[[:space:]]*s[[:space:]]*24[[:space:]]*ultra\\b'),1,0) AS tok_s24ultra,
         IF(REGEXP_CONTAINS(tp_lc, r'\\bgalaxy[[:space:]]*s[[:space:]]*24[[:space:]]*\\+\\b|\\bgalaxy\\s*s\\s*24\\s*plus\\b'),1,0) AS tok_s24plus,
         IF(REGEXP_CONTAINS(tp_lc, r'\\bgalaxy[[:space:]]*s[[:space:]]*24\\b') AND NOT REGEXP_CONTAINS(tp_lc, r'\\b(ultra|plus|fe)\\b'),1,0) AS tok_s24,
-
-        -- Samsung A series (A55, A35, etc.)
         IF(REGEXP_CONTAINS(tp_lc, r'\\bgalaxy[[:space:]]*a[[:space:]]*56\\b'),1,0) AS tok_a56,
         IF(REGEXP_CONTAINS(tp_lc, r'\\bgalaxy[[:space:]]*a[[:space:]]*55\\b'),1,0) AS tok_a55,
         IF(REGEXP_CONTAINS(tp_lc, r'\\bgalaxy[[:space:]]*a[[:space:]]*36\\b'),1,0) AS tok_a36,
@@ -758,27 +820,22 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
         IF(REGEXP_CONTAINS(tp_lc, r'\\bgalaxy[[:space:]]*a[[:space:]]*16\\b'),1,0) AS tok_a16,
         IF(REGEXP_CONTAINS(tp_lc, r'\\bgalaxy[[:space:]]*a[[:space:]]*15\\b'),1,0) AS tok_a15,
 
-        -- genéricos familia+número
         IF(REGEXP_CONTAINS(tp_lc, r'\\bgalaxy[[:space:]]*(s|a|m)[[:space:]]*[0-9]{1,2}\\b'), 1, 0) AS famnum_samsung,
         IF(REGEXP_CONTAINS(tp_lc, r'\\biphone[[:space:]]*[0-9]{1,2}\\b'), 1, 0) AS famnum_iphone
       FROM enriched_base2
     ),
-
-    /* **CORRECCIÓN:** Se calcula el scoring en una única etapa y se seleccionan TODAS las columnas*/
     scored AS (
       SELECT
-        e.*, -- Seleccionar todas las columnas anteriores
-        
-        -- 1. Cálculo de Penalización de Variante
+        e.*,
         CASE
           WHEN @want_pro=1 THEN CASE
             WHEN has_pro_only=1 THEN 0
-            WHEN has_pro_max=1  THEN -120 -- Penaliza si es Pro Max y solo se busca Pro
+            WHEN has_pro_max=1  THEN -120 
             ELSE -60
           END
           WHEN @want_plus=1 THEN CASE
             WHEN has_plus=1 THEN 0
-            WHEN has_ultra=1 THEN -120 -- Penaliza si es Ultra y solo se busca Plus
+            WHEN has_ultra=1 THEN -120 
             ELSE -60
           END
           WHEN @want_ultra=1    THEN CASE WHEN has_ultra=1    THEN 0 ELSE -120 END
@@ -792,36 +849,30 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
             THEN -60 ELSE 0
           END
         END AS variant_penalty,
-
-        -- 2. Cálculo de Penalización de Número Inconsistente (Apple)
         CASE
           WHEN @brand_lock = TRUE AND @brand_kw = 'iphone' AND @qnum IS NOT NULL AND @qnum != '' THEN
             CASE
-              WHEN e.model_number IS NULL THEN 0 -- Usar alias de tabla e.
-              WHEN CAST(@qnum AS INT64) = e.model_number THEN 0 -- Usar alias de tabla e.
+              WHEN e.model_number IS NULL THEN 0 
+              WHEN CAST(@qnum AS INT64) = e.model_number THEN 0 
               ELSE -80
             END
           ELSE 0
         END AS apple_num_mismatch_penalty,
-
-        -- 3. Cálculo de Match Score Final
         (
-          50 * ( -- Peso alto a los tokens de modelo específico (e.g. tok_a55, tok_ip17pro)
+          50 * (
             e.tok_ip17promax + e.tok_ip17pro + e.tok_ip17plus + e.tok_ip17 +
             e.tok_ip16promax + e.tok_ip16pro + e.tok_ip16 + e.tok_ip15 + e.tok_ip14 +
             e.tok_s25ultra + e.tok_s25plus + e.tok_s25fe + e.tok_s25 +
             e.tok_s24ultra + e.tok_s24plus + e.tok_s24 +
             e.tok_a56 + e.tok_a55 + e.tok_a36 + e.tok_a35 + e.tok_a17 + e.tok_a16 + e.tok_a15
           )
-          + 10 * (e.famnum_samsung + e.famnum_iphone) -- Peso medio a tokens genéricos (e.g. galaxy s)
+          + 10 * (e.famnum_samsung + e.famnum_iphone)
           + 3  * IF(@prio79, e.plan_max_7990, 0)
-          + 8  * e.cap_hit -- MEJORA: Mayor peso al almacenamiento explícito
+          + 8  * e.cap_hit
           + 1  * ARRAY_LENGTH(ARRAY(SELECT t FROM UNNEST(@terms) AS t WHERE STRPOS(e.tp_lc, t) > 0))
-          + (CASE WHEN @want_pro=1 THEN (CASE WHEN e.has_pro_only=1 THEN 0 ELSE -120 END) WHEN @want_pro_max=1 THEN (CASE WHEN e.has_pro_max=1 THEN 0 ELSE -120 END) ELSE 0 END) -- Peor caso, usar lógica inline para variant
-          + (CASE WHEN @brand_lock = TRUE AND @brand_kw = 'iphone' AND @qnum IS NOT NULL AND @qnum != '' THEN (CASE WHEN e.model_number IS NULL THEN 0 WHEN CAST(@qnum AS INT64) = e.model_number THEN 0 ELSE -80 END) ELSE 0 END) -- Peor caso, usar lógica inline para mismatch
-          -- Se usa el nombre de las columnas calculadas en el CTE scored
+          + (CASE WHEN @want_pro=1 THEN (CASE WHEN e.has_pro_only=1 THEN 0 ELSE -120 END) WHEN @want_pro_max=1 THEN (CASE WHEN e.has_pro_max=1 THEN 0 ELSE -120 END) ELSE 0 END)
+          + (CASE WHEN @brand_lock = TRUE AND @brand_kw = 'iphone' AND @qnum IS NOT NULL AND @qnum != '' THEN (CASE WHEN e.model_number IS NULL THEN 0 WHEN CAST(@qnum AS INT64) = e.model_number THEN 0 ELSE -80 END) ELSE 0 END)
         ) AS match_score,
-
         IF(
           @qnum IS NULL OR @qnum = '',
           0,
@@ -832,8 +883,7 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
         ) AS number_soft_score
       FROM enriched e
     )
-
-    SELECT * -- Selecciona todas las columnas, incluidas las de scoring
+    SELECT *
     FROM scored
     WHERE
       (@qnum IS NULL OR @qnum = '' OR number_soft_score >= 1)
@@ -844,7 +894,6 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
             (@series = 'm' AND REGEXP_CONTAINS(title_norm, r'\\bgalaxy\\b') AND REGEXP_CONTAINS(title_norm, 'm' || @qnum))
       )
     ORDER BY
-      -- Ordenamiento prioriza la coincidencia de tokens específicos y luego la penalización de variante
       (tok_ip17promax + tok_ip17pro + tok_ip17plus + tok_ip17 +
        tok_ip16promax + tok_ip16pro + tok_ip16 + tok_ip15 + tok_ip14 +
        tok_s25ultra + tok_s25plus + tok_s25fe + tok_s25 +
@@ -866,15 +915,12 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
             bigquery.ScalarQueryParameter("want_prepago", "BOOL", want_prepago),
             bigquery.ScalarQueryParameter("explicit_mod", "STRING", explicit_mod or ""),
             bigquery.ScalarQueryParameter("force_prepago", "BOOL", force_prepago),
-
             bigquery.ScalarQueryParameter("brand_lock", "BOOL", bool(brand_lock)),
             bigquery.ArrayQueryParameter("brand_aliases", "STRING", brand_aliases or []),
             bigquery.ScalarQueryParameter("brand_kw", "STRING", brand_kw),
             bigquery.ArrayQueryParameter("other_terms", "STRING", other_terms),
-
             bigquery.ScalarQueryParameter("storage", "STRING", storage),
             bigquery.ScalarQueryParameter("cheap", "BOOL", cheap),
-
             bigquery.ScalarQueryParameter("want_pro_max", "INT64", want_pro_max),
             bigquery.ScalarQueryParameter("want_pro", "INT64", want_pro),
             bigquery.ScalarQueryParameter("want_ultra", "INT64", want_ultra),
@@ -888,7 +934,6 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
     rows = list(bq_client.query(strict_sql, job_config=job_config).result())
 
     if not rows:
-        # (Opcional) Relaxed query: dejamos como estaba antes, ya con brand_lock activo
         relaxed_sql = f"""
         DECLARE qnum STRING DEFAULT @qnum;
         WITH base AS (
@@ -958,15 +1003,10 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
 
     had_exact = bool(rows) and bool(qnum)
 
-    # Fallback cercanos (misma marca, modelo ±2)
     if (not rows or not had_exact) and (canon and qnum and qnum.isdigit()):
         q = int(qnum)
-        # Ampliamos a +/- 2 generaciones
         near_nums = [str(max(1, q-2)), str(max(1, q-1)), str(q+1), str(q+2)]
-        
-        # Filtramos números fuera del rango S/A (10-30) para evitar sugerir modelos obsoletos
         near_nums = [n for n in near_nums if 10 <= int(n) <= 30] 
-        
         near_sql = f"""
         WITH base AS (
           SELECT id, brand, title_product, image, calltoaction_url, line, modality, financing,
@@ -997,7 +1037,7 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
         near_rows = list(bq_client.query(near_sql, job_config=jc2).result())
         if near_rows:
             rows = near_rows
-            had_exact = False # Si entra aquí, no fue un "exact match"
+            had_exact = False 
 
     cand = []
     for r in rows:
@@ -1015,6 +1055,7 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
     return top, had_exact, nq
 
 # ------------------ BQ: Marca-solo (TOP5 último mes) ------------------
+# [SECCION REINTEGRADA: AUXILIARES PARA TOP 5 MARCAS]
 def _last_closed_month_start_date_lima() -> datetime.date:
     now_lima = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-5)))
     first_this_month = now_lima.replace(day=1).date()
@@ -1087,6 +1128,7 @@ def _fetch_top5_names_by_brand_last_month(brand_focus: str) -> Tuple[List[str], 
     names2 = [r["producto"] for r in rows2]
     return names2, mes_label
 
+# [SECCION REINTEGRADA: FUNCION PRINCIPAL DE BUSQUEDA TOP 5]
 def search_brand_top5_products(nq_brand: str) -> Tuple[List[dict], str]:
     brand_focus = _canonical_brand_from_query(nq_brand)
     if not brand_focus:
@@ -1269,6 +1311,7 @@ def search_brand_top5_products(nq_brand: str) -> Tuple[List[dict], str]:
     return items, mes_label
 
 # ------------------ Accesorios / tienda_productos ------------------
+# [OPTIMIZACIÓN] Limit aumentado a 50 en SQL
 def _run_accessories_query(nq_terms: List[str], brand_focus: Optional[str], require_brand: bool, strict_brand: bool = False, cat_hint: str = "") -> List[dict]:
     if not nq_terms:
         return []
@@ -1312,7 +1355,6 @@ def _run_accessories_query(nq_terms: List[str], brand_focus: Optional[str], requ
           1, 0
         ) AS matches_brand_strict,
 
-        -- flags por categoría
         IF(REGEXP_CONTAINS(LOWER(IFNULL(title_product,'')), r'\\bipad\\b'),1,0) AS is_ipad,
         IF(REGEXP_CONTAINS(LOWER(IFNULL(title_product,'')), r'\\btablet\\b'),1,0) AS is_tablet,
         IF(REGEXP_CONTAINS(LOWER(IFNULL(title_product,'')), r'\\bsmartwatch\\b|\\breloj\\s+inteligente\\b|\\bwatch\\b'),1,0) AS is_smartwatch,
@@ -1358,7 +1400,7 @@ def _run_accessories_query(nq_terms: List[str], brand_focus: Optional[str], requ
       CASE WHEN @strict_brand = TRUE THEN matches_brand_strict ELSE matches_brand_relaxed END DESC,
       match_score DESC,
       COALESCE(porcentaje_descuento, 0) DESC
-    LIMIT 12
+    LIMIT 50
     """
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
@@ -1393,19 +1435,16 @@ def search_accessories_bq(nq: str) -> List[dict]:
 
     unique_items = {}
     
-    # 1. Búsqueda estricta por marca
     if brand_focus:
         res_brand = _run_accessories_query(terms, brand_focus=brand_focus, require_brand=True, strict_brand=False, cat_hint=cat_hint)
         for item in res_brand:
             unique_items.setdefault(item['id'], item)
 
-    # 2. Búsqueda por categoría (genérica)
     if cat_hint:
         res_generic_cat = _run_accessories_query(terms, brand_focus=None, require_brand=False, strict_brand=False, cat_hint=cat_hint)
         for item in res_generic_cat:
             unique_items.setdefault(item['id'], item)
 
-    # 3. Relleno para términos muy genéricos (cargador)
     if len(unique_items) < 5 and not brand_focus and 'cargador' in nq.lower():
          res_wide = _run_accessories_query(terms, brand_focus=None, require_brand=False, strict_brand=False, cat_hint='charg_wireless')
          for item in res_wide:
@@ -1451,12 +1490,10 @@ def search_accessories_bq(nq: str) -> List[dict]:
 
 # ------------------ BQ: Planes ------------------
 def search_plans_bq(nq: str) -> List[dict]:
-    # Determinar si es postpago o prepago
     is_prepago = _has_prepago_term(nq) or 'prepago' in nq.lower()
     line_filter_product = "Claro Chip Claro Prepago" if is_prepago else "Claro Chip Claro Postpago"
     line_label = "Postpago" if not is_prepago else "Prepago"
     
-    # Se buscará en title_product por "Claro Chip Claro Postpago" o "Claro Chip Claro Prepago"
     sql = f"""
     SELECT
       id, brand, title_product, image, calltoaction_url, line, modality, financing,
@@ -1500,7 +1537,6 @@ def search_plans_bq(nq: str) -> List[dict]:
     
     return plans
 
-
 # ------------------ Recomendados fijos ------------------
 DEFAULT_RECOMMENDATIONS = [
     {"nombre": "Celulares en Tienda Claro", "texto": "Explora todos los equipos, ofertas y promociones. Compra online y recíbelo en casa.", "url": "https://www.claro.com.pe/personas/tienda/celulares/"},
@@ -1508,24 +1544,14 @@ DEFAULT_RECOMMENDATIONS = [
     {"nombre": "Móvil Claro", "texto": "Información de prepago, postpago y servicios móviles en un solo lugar.", "url": "https://www.claro.com.pe/personas/movil/"}
 ]
 
-# ------------------ Claro Video ------------------
+# ------------------ Claro Video (Optimizado) ------------------
 def build_claro_video_response(normalized_query: str) -> dict:
-    """
-    Construye la respuesta para categoría 'pelicula' usando el catálogo de Claro video en BigQuery.
-
-    - Usa search_claro_video_catalog() para obtener:
-        * Lista de películas principales (coincidencias fuertes) -> 'listado'
-        * Lista de relacionadas (otras recomendadas) -> 'relacionados'
-    - Si no encuentra nada, cae en un fallback informativo estático.
-    """
-
     try:
         main_movies, related_movies = search_claro_video_catalog(normalized_query)
     except Exception as e:
         logger.exception("Error construyendo respuesta de Claro video", exc_info=e)
         main_movies, related_movies = [], []
 
-    # -------- Caso: no se encontró match claro en catálogo --------
     if not main_movies:
         descripcion = (
             "Por el momento no encontré una película específica en el catálogo de Claro video "
@@ -1569,48 +1595,33 @@ def build_claro_video_response(normalized_query: str) -> dict:
             "relacionados": relacionados,
         }
 
-    # -------- Caso: SÍ se encontraron películas --------
-
     first_movie = main_movies[0]
-    titulo_pelicula = (
-        first_movie.get("title")
-        or first_movie.get("title_original")
-        or "esta película"
-    )
+    titulo_pelicula = (first_movie.get("title") or first_movie.get("title_original") or "esta película")
+    titulo_marketero = f"¡Disfruta «{titulo_pelicula}» en Claro Video!"
 
-    titulo_marketero = f"¡Disfruta «{titulo_pelicula}» en Claro video!"
-
-    # LISTADO: todas las coincidencias "principales"
     listado = []
     for m in main_movies:
-        listado.append(
-            {
-                "nombre": m.get("title") or m.get("title_original"),
-                "texto": m.get("description_large") or m.get("description"),
-                "url": m.get("url"),
-                "imagen": (
-                    m.get("image_medium")
-                    or m.get("image_small")
-                    or m.get("image_large")
-                ),
-            }
-        )
+        desc = (m.get("description_large") or m.get("description") or "")
+        # [OPTIMIZACIÓN] Truncar descripción a 200 chars
+        if len(desc) > 150: desc = desc[:150] + "..."
+        listado.append({
+            "nombre": m.get("title") or m.get("title_original"),
+            "texto": desc,
+            "url": m.get("url"),
+            "imagen": (m.get("image_medium") or m.get("image_small") or m.get("image_large")),
+        })
 
-    # RELACIONADOS: el resto
     relacionados = []
     for m in related_movies:
-        relacionados.append(
-            {
-                "nombre": m.get("title") or m.get("title_original"),
-                "texto": m.get("description_large") or m.get("description"),
-                "url": m.get("url"),
-                "imagen": (
-                    m.get("image_medium")
-                    or m.get("image_small")
-                    or m.get("image_large")
-                ),
-            }
-        )
+        desc = (m.get("description_large") or m.get("description") or "")
+        # [OPTIMIZACIÓN] Truncar descripción a 200 chars
+        if len(desc) > 150: desc = desc[:150] + "..."
+        relacionados.append({
+            "nombre": m.get("title") or m.get("title_original"),
+            "texto": desc,
+            "url": m.get("url"),
+            "imagen": (m.get("image_medium") or m.get("image_small") or m.get("image_large")),
+        })
 
     descripcion = (
         "Accede a Claro video con tus credenciales de Claro y disfruta de estas películas cuando quieras. "
@@ -1655,15 +1666,39 @@ def query_dev():
     try:
         normalized_query, category = classify_with_gemini(user_query)
 
+        # category = clasificador(normalized_query)
+
+
         if category == "pelicula":
-            respuesta = build_claro_video_response(normalized_query)
-            respuesta["tipo_respuesta"] = "general"
-            respuesta["_meta"] = {"normalized_query": normalized_query, "category": category, "cache_hit": False}
-            guardar_pregunta_en_historial(normalized_query, sia_id, respuesta, pregunta_timestamp, user_agent)
-            return jsonify(respuesta)
+          try:
+              respuesta = call_clarovideo_movies_api(normalized_query)
+          except Exception as e:
+              logger.exception("Error llamando ClaroVideo Movies API", exc_info=e)
+              respuesta = {
+                  "_meta": {"cache_hit": False, "category": "pelicula", "normalized_query": normalized_query},
+                  "descripcion": "Ocurrió un error al buscar en Claro video. Intenta nuevamente más tarde.",
+                  "listado": [],
+                  "relacionados": [],
+                  "query": normalized_query,
+                  "status": "Error",
+                  "tipo": "pelicula",
+                  "tipo_respuesta": "general",
+                  "titulo": "Claro video: búsqueda de películas"
+              }
+
+          # Si quieres que tu backend “mande” el meta siempre (aunque el microservicio ya lo tenga)
+          respuesta["tipo_respuesta"] = respuesta.get("tipo_respuesta", "general")
+          respuesta["_meta"] = {"normalized_query": normalized_query, "category": category, "cache_hit": False}
+
+          guardar_pregunta_en_historial(normalized_query, sia_id, respuesta, pregunta_timestamp, user_agent)
+          return jsonify(respuesta)
+
 
         respuesta = None
         uso_cache = False
+        
+        # [FIX CRÍTICO]: brand_name definido antes
+        brand_name = _canonical_brand_from_query(normalized_query) 
 
         if category == "general":
             cache = buscar_respuesta_definitiva(normalized_query)
@@ -1671,38 +1706,38 @@ def query_dev():
                 uso_cache = True
                 respuesta = json.loads(cache)
         
-        # --- Planes Móviles ---
+        # [FIX CRÍTICO]: Cache para Planes
         if respuesta is None and category == "planes":
-            planes = search_plans_bq(normalized_query)
-            plan_type = "Postpago" if not _has_prepago_term(normalized_query) and 'postpago' in normalized_query.lower() else "Prepago"
-            
-            # Se usa el motor de Vertex para generar un resumen
-            general_response = get_summary_from_vertex(normalized_query)
+            cache = buscar_respuesta_definitiva(normalized_query)
+            if cache:
+                uso_cache = True
+                respuesta = json.loads(cache)
+            else:
+                planes = search_plans_bq(normalized_query)
+                plan_type = "Postpago" if not _has_prepago_term(normalized_query) and 'postpago' in normalized_query.lower() else "Prepago"
+                general_response = get_summary_from_vertex(normalized_query)
 
-            respuesta = {
-                "titulo": general_response.get("titulo", f"Planes Móviles {plan_type} Claro"),
-                "descripcion": general_response.get("descripcion", f"¡Descubre la libertad y beneficios de nuestros planes {plan_type} Claro!"),
-                "planes": planes,
-                "listado": general_response.get("listado", []),
-                "relacionados": general_response.get("relacionados", []),
-                "status": "Found" if planes or general_response.get("status") == "Found" else "Not Found",
-                "query": normalized_query,
-                "tipo_respuesta": "general",
-            }
-            guardar_en_respuestas_definitivas(normalized_query, respuesta)
+                respuesta = {
+                    "titulo": general_response.get("titulo", f"Planes Móviles {plan_type} Claro"),
+                    "descripcion": general_response.get("descripcion", f"¡Descubre la libertad y beneficios de nuestros planes {plan_type} Claro!"),
+                    "planes": planes,
+                    "listado": general_response.get("listado", []),
+                    "relacionados": general_response.get("relacionados", []),
+                    "status": "Found" if planes or general_response.get("status") == "Found" else "Not Found",
+                    "query": normalized_query,
+                    "tipo_respuesta": "general",
+                }
+                guardar_en_respuestas_definitivas(normalized_query, respuesta)
+            
             respuesta["_meta"] = {"normalized_query": normalized_query, "category": category, "cache_hit": uso_cache}
             guardar_pregunta_en_historial(normalized_query, sia_id, respuesta, pregunta_timestamp, user_agent)
             return jsonify(respuesta)
 
-
-        # --- tienda_productos (accesorios/routers) ---
         if respuesta is None and category == "tienda_productos":
             producto_tp = search_accessories_bq(normalized_query)
-
-            # Forzar Lenovo a tienda_productos
             if brand_name == "lenovo":
                 respuesta = {
-                    "titulo": f"¡Ofertas Exclusivas para {normalized_query} en Tienda Claro!",
+                    "titulo": f"¡Ofertas Exclusivas Lenovo en Tienda Claro!",
                     "descripcion": f"Descubre lo que tenemos para ti: ¡lo último en tecnología te espera!",
                     "producto": producto_tp,
                     "recomendados": DEFAULT_RECOMMENDATIONS,
@@ -1711,7 +1746,7 @@ def query_dev():
                 }
             elif producto_tp:
                 respuesta = {
-                    "titulo": f"¡Encontramos lo que buscabas para {normalized_query}!",
+                    "titulo": f"¡Encontramos {normalized_query.title()} para ti!",
                     "descripcion": "¡Potencia tu mundo con la mejor tecnología! Mira estas opciones irresistibles.",
                     "producto": producto_tp,
                     "recomendados": DEFAULT_RECOMMENDATIONS,
@@ -1720,8 +1755,8 @@ def query_dev():
                 }
             else:
                 respuesta = {
-                    "titulo": f"Ups, no encontramos resultados para {normalized_query}",
-                    "descripcion": "No encontramos coincidencias exactas en accesorios o productos de tienda. Explora nuestras recomendaciones:",
+                    "titulo": f"Ups, no encontramos '{normalized_query}' por ahora",
+                    "descripcion": "No encontramos coincidencias exactas en accesorios. Explora nuestras recomendaciones más populares:",
                     "producto": [],
                     "recomendados": DEFAULT_RECOMMENDATIONS,
                     "status": "Not Found",
@@ -1731,9 +1766,6 @@ def query_dev():
             guardar_pregunta_en_historial(normalized_query, sia_id, respuesta, pregunta_timestamp, user_agent)
             return jsonify(respuesta)
         
-        # --- Marca sola → TOP5 ---
-        brand_name = _canonical_brand_from_query(normalized_query)
-        # MEJORA: Se añade 'poco' y 'redmi' al check de marca simple
         is_simple_brand_query = normalized_query in ["iphone", "samsung", "galaxy", "xiaomi", "redmi", "poco", "motorola", "moto"]
         only_brand_corrected = (
             brand_name is not None
@@ -1741,19 +1773,15 @@ def query_dev():
             and (is_simple_brand_query or not _match_any(PHONE_MODEL_PATTERNS, normalized_query))
         )
         
-        # --- Celulares / Marca Simple Top 5 ---
         if respuesta is None:
             if category == "celulares" and only_brand_corrected:
                 top5_brand_items, mes_label = search_brand_top5_products(normalized_query)
                 if top5_brand_items:
                     accesorios = search_accessories_bq(normalized_query)
-
                     brand_cap = _canonical_brand_from_query(normalized_query).capitalize()
-                    desc = f"Descubre los equipos más populares de {brand_cap}. ¡Tendencias de {mes_label}! Llévalo con un **Plan Max Ilimitado 79.90** para disfrutar al máximo."
-
                     respuesta = {
-                        "titulo": f"¡Los Más Vendidos de {brand_cap} están en Claro!",
-                        "descripcion": desc,
+                        "titulo": f"¡Los Más Vendidos de {brand_cap} en Claro!",
+                        "descripcion": f"Descubre los equipos más populares de {brand_cap}. ¡Tendencias de {mes_label}! Llévalo con un Plan Max Ilimitado 79.90.",
                         "producto": top5_brand_items,
                         "recomendados": accesorios if accesorios else DEFAULT_RECOMMENDATIONS,
                         "status": "Found",
@@ -1763,26 +1791,22 @@ def query_dev():
                     guardar_pregunta_en_historial(normalized_query, sia_id, respuesta, pregunta_timestamp, user_agent)
                     return jsonify(respuesta)
 
-            # Lógica para búsqueda de modelos específicos
             if category == "celulares":
                 topN, had_exact, wanted_label = search_products_bq(
                     normalized_query,
                     prioritize_plan_79=(category == "celulares")
                 )
-
-                # Recomendados por marca (si se detecta)
                 accesorios = search_accessories_bq(normalized_query)
                 recomendados = accesorios if accesorios else DEFAULT_RECOMMENDATIONS
                 
                 if topN:
-                    # Mensaje más marketero
                     if had_exact:
-                        desc = f"¡Lo tenemos! El {wanted_label.capitalize()} te espera. Descubre nuestras ofertas exclusivas en Tienda Claro"
+                        desc = f"¡Lo tenemos! El {wanted_label.title()} te espera con ofertas exclusivas en planes de renovación y portabilidad." 
                     else:
-                        desc = f"¡Te mostramos opciones irresistibles! Por el momento no contamos con el {wanted_label.capitalize()} exacto, pero estos modelos cercanos te encantarán."
+                        desc = f"¡Te mostramos opciones irresistibles! No tenemos el {wanted_label.title()} exacto, pero estos modelos similares te encantarán."
                     
                     respuesta = {
-                        "titulo": f"¡Encuentra tu {wanted_label.capitalize()} en Tienda Claro!",
+                        "titulo": f"¡Encuentra tu {wanted_label.title()} en Tienda Claro!",
                         "descripcion": desc,
                         "producto": topN,
                         "recomendados": recomendados,
@@ -1791,15 +1815,14 @@ def query_dev():
                     }
                 else:
                     respuesta = {
-                        "titulo": f"Ups, no encontramos resultados para {normalized_query}",
-                        "descripcion": f"Lo sentimos, no encontramos el **{normalized_query.capitalize()}** en nuestra tienda. ¡Pero no te preocupes! Tenemos alternativas increíbles:",
+                        "titulo": f"Ups, no encontramos el modelo {normalized_query.title()}",
+                        "descripcion": f"No encontramos ese modelo exacto, pero mira estas alternativas increíbles o explora nuestras recomendaciones:",
                         "producto": [],
                         "recomendados": recomendados,
                         "status": "Not Found",
                         "tipo_respuesta": "tienda",
                     }
             else:
-                # General → Vertex
                 respuesta = get_summary_from_vertex(normalized_query)
                 respuesta["query"] = normalized_query
                 respuesta["tipo_respuesta"] = "general"
@@ -1807,15 +1830,45 @@ def query_dev():
 
         guardar_pregunta_en_historial(normalized_query, sia_id, respuesta, pregunta_timestamp, user_agent)
         respuesta["_meta"] = {"normalized_query": normalized_query, "category": category, "cache_hit": uso_cache}
+
+# ✅ FALLBACK A PELÍCULAS (ÚNICO PUNTO)
+        if category == "general" and respuesta:
+            status = respuesta.get("status")
+            is_not_found = status in ("NotFound", "Not Found")
+            is_clarovideo_disfruta = title_is_clarovideo_disfruta(respuesta)
+            is_clarovideo_descripcion = description_is_clarovideo_disfruta(respuesta)
+            is_clarovideo_pelicula = description_is_clarovideo_genero(respuesta) 
+
+            if is_not_found or is_clarovideo_disfruta or is_clarovideo_descripcion or is_clarovideo_pelicula:
+                movies_hit = try_movies_first(normalized_query)
+                if movies_hit:
+                    movies_hit["_meta"] = {
+                        "cache_hit": False,
+                        "category": "pelicula",
+                        "normalized_query": normalized_query,
+                    }
+                    guardar_pregunta_en_historial(
+                        normalized_query,
+                        sia_id,
+                        movies_hit,
+                        pregunta_timestamp,
+                        user_agent
+                    )
+                    return jsonify(movies_hit)
+
+
+        # ✅ Si no hubo fallback, recién guardas el historial normal
+        guardar_pregunta_en_historial(normalized_query, sia_id, respuesta, pregunta_timestamp, user_agent)
         return jsonify(respuesta)
 
     except Exception as e:
-        logger.error(f"[dev] Error procesando '{user_query}': {e}", exc_info=True)
+        error_msg = str(e)
+        logger.error(f"[dev] Error procesando '{user_query}': {error_msg}", exc_info=True)
         return jsonify({
-            "titulo": "Error inesperado",
-            "descripcion": "<p>Ocurrió un error al procesar tu solicitud.</p>",
+            "titulo": "Error interno del sistema",
+            "descripcion": f"<p>Ocurrió un inconveniente al procesar tu solicitud. ({error_msg})</p><p>Por favor intenta nuevamente en unos segundos.</p>",
             "query": user_query,
             "status": "Error",
             "tipo_respuesta": "general",
-            "error_detalle": str(e)
+            "error_detalle": error_msg
         }), 500

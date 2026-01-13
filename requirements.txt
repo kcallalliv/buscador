@@ -7,3 +7,6 @@ Flask-Limiter
 google-cloud-aiplatform>=1.65.0
 google-cloud-discoveryengine
 rapidfuzz==3.14.2
+requests==2.32.3
+
+

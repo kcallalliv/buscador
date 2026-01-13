@@ -26,5 +26,5 @@ COPY app /app/app
 ENV PORT=8080
 
 # Comando: apunta a la app exportada en app/__init__.py
-CMD exec gunicorn -b :${PORT} -w 2 "app:app"
+CMD exec gunicorn -b :${PORT} -w 2 --timeout 55 "app:app"
 
