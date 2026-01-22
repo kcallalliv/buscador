@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import hashlib
 import unicodedata
 from difflib import SequenceMatcher
 from typing import List, Tuple, Optional
@@ -100,11 +101,21 @@ BQ_TABLE_CLAROVIDEO = "prd-claro-mktg-data-storage.claro_video.catalogo"
 
 # ------------------ Blueprint ------------------
 dev_bp = Blueprint("dev_bp", __name__)
-CORS(dev_bp, resources={r"/dev/*": {"origins": [
+#CORS(dev_bp, resources={r"/dev/*": {"origins": [
+#    "https://www.claro.com.pe",
+#    "https://test-claro-pe.prod.clarodigital.net",
+#    "https://search-test-1079186964678.us-central1.run.app",
+#    "https://search-api-1079186964678.us-central1.run.app",
+#    "https://genia-front-test-1079186964678.us-central1.run.app",
+#]}})
+
+DEV_ALLOWED_ORIGINS = [
     "https://www.claro.com.pe",
     "https://test-claro-pe.prod.clarodigital.net",
     "https://search-test-1079186964678.us-central1.run.app",
-]}})
+    "https://search-api-1079186964678.us-central1.run.app",
+    "https://genia-front-test-1079186964678.us-central1.run.app"]
+CORS(dev_bp, resources={r"/dev/*": {"origins": DEV_ALLOWED_ORIGINS}})
 
 def call_clarovideo_movies_api(normalized_query: str) -> dict:
     payload = {"query": normalized_query}
@@ -528,6 +539,30 @@ def _terms_from_query(nq: str) -> List[str]:
 def _nums_from_query(nq: str) -> List[str]:
     return re.findall(r"\b\d{1,4}\b", nq)
 
+FILLER_QUERY_TERMS = {
+    "quiero", "comprar", "compro", "compra", "comprarlo", "comprarla", "adquirir",
+    "adquirirme", "busco", "buscar", "deseo", "necesito", "quisiera", "quieres",
+    "dame", "muestrame", "muestra", "mostrar", "ver", "cotizar", "precio", "precios",
+    "oferta", "ofertas", "promo", "promocion", "promociones", "nuevo", "nueva",
+    "nuevos", "nuevas", "un", "una", "el", "la", "los", "las", "de", "del", "para",
+    "por", "favor", "porfa", "mi", "tu", "su", "equipo", "celular", "smartphone",
+    "que", "qué", "recomiendas", "tienes", "disponible", "disponibles", "sugerir", "sugieres", "recomendacion","regalar", "no","se","que"
+}
+
+COLOR_PATTERNS = {
+    "negro": r"(negro|black)",
+    "blanco": r"(blanco|white)",
+    "azul": r"(azul|blue)",
+    "verde": r"(verde|green)",
+    "rojo": r"(rojo|red)",
+    "rosado": r"(rosado|rosa|pink)",
+    "morado": r"(morado|violeta|purple)",
+    "gris": r"(gris|gray|grey)",
+    "plata": r"(plata|silver)",
+    "dorado": r"(dorado|gold)",
+    "titanio": r"(titanio|titanium)",
+}
+
 BRAND_TERMS_FOR_MODEL = {
     "iphone","samsung","galaxy","xiaomi","redmi","poco","huawei",
     "motorola","moto","pixel","honor","infinix","tecno","oppo","realme","vivo","lenovo","zte"
@@ -554,6 +589,188 @@ def _canonical_brand_from_query(nq: str) -> Optional[str]:
     if "lenovo" in s: return "lenovo"
     if "zte" in s: return "zte"
     return None
+
+def _strip_fillers_from_query(nq: str) -> str:
+    tokens = re.findall(r"[a-z0-9]+", nq.lower())
+    cleaned = [t for t in tokens if t not in FILLER_QUERY_TERMS]
+    if not cleaned:
+        return nq
+    return " ".join(cleaned)
+
+def _color_from_query(nq: str) -> Tuple[str, str]:
+    for key, pattern in COLOR_PATTERNS.items():
+        if re.search(rf"\b{key}\b", nq):
+            return key, pattern
+        if re.search(pattern, nq):
+            return key, pattern
+    return "", ""
+
+def _extract_color_from_title(title: str) -> str:
+    t = strip_accents((title or "").lower())
+    for key, pattern in COLOR_PATTERNS.items():
+        if re.search(pattern, t):
+            return key
+    return ""
+
+def _extract_storage_from_title(title: str) -> int:
+    t = strip_accents((title or "").lower())
+    m = re.search(r"\b(\d{2,4})\s*gb\b", t)
+    return int(m.group(1)) if m else 0
+
+def _extract_model_number_from_title(title: str, brand: str) -> int:
+    t = strip_accents((title or "").lower())
+    t = re.sub(r"\b\d{2,4}\s*gb\b", "", t)
+    numbers = [int(n) for n in re.findall(r"\b(\d{1,2})\b", t)]
+    if brand == "apple":
+        candidates = [n for n in numbers if 10 <= n <= 30]
+    else:
+        candidates = [n for n in numbers if 1 <= n <= 99]
+    return max(candidates) if candidates else 0
+
+def _variant_rank(title: str) -> int:
+    t = strip_accents((title or "").lower())
+    if re.search(r"\bpro[\s-]*max\b|\bpromax\b", t):
+        return 3
+    if re.search(r"\bpro\b", t):
+        return 2
+    if re.search(r"\bplus\b|\b\+\b", t):
+        return 1
+    return 0
+
+def _brand_display_label(nq: str) -> Optional[str]:
+    s = nq.lower()
+    if "iphone" in s: return "iPhone"
+    if "galaxy" in s: return "Galaxy"
+    if "redmi" in s: return "Redmi"
+    if "poco" in s: return "Poco"
+    if "pixel" in s: return "Pixel"
+    if "moto" in s or "motorola" in s: return "Motorola"
+    canon = _canonical_brand_from_query(s)
+    if not canon:
+        return None
+    if canon == "xiaomi": return "Xiaomi"
+    if canon == "samsung": return "Samsung"
+    if canon == "apple": return "iPhone"
+    return canon.capitalize()
+
+def _format_phone_label(label: str) -> str:
+    if not label:
+        return label
+    words = []
+    for token in label.split():
+        if token.lower() == "iphone":
+            words.append("iPhone")
+        elif token.lower() == "galaxy":
+            words.append("Galaxy")
+        else:
+            words.append(token.title())
+    return " ".join(words)
+
+def _display_query_for_phone(nq: str) -> str:
+    cleaned = _strip_fillers_from_query(nq)
+    label = _brand_display_label(cleaned)
+    if label and not _match_any(PHONE_MODEL_PATTERNS, cleaned) and not _nums_from_query(cleaned):
+        return label
+    return _format_phone_label(cleaned)
+
+BRAND_RESPONSE_TEMPLATES = [
+    "¡Excelente elección! Elegir un {brand} es apostar por innovación, seguridad y rendimiento que se renueva cada año. Mira estos modelos disponibles y encuentra el que mejor se adapta a ti 👇",
+    "El {brand} es sinónimo de tecnología premium. Cada generación mejora en cámara, potencia y experiencia de uso. Aquí tienes los modelos más destacados para que elijas el ideal 📱✨",
+    "Buena decisión, estás eligiendo uno de los smartphones más completos del mercado. Déjame mostrarte las mejores opciones de {brand} disponibles ahora mismo 👇",
+    "Qué gran oportunidad de tener un {brand}. Diseño elegante, rendimiento potente y un ecosistema que lo hace todo más fácil. Descubre estos modelos y elige el que va contigo 🚀",
+    "Un {brand} no es solo un celular, es una experiencia. Fotos increíbles, fluidez total y actualizaciones constantes. Mira estos modelos disponibles y da el siguiente paso 📲",
+    "Si estás pensando en un {brand}, vas por el camino correcto. Estos modelos destacan por su potencia, cámara y estilo. Elige el tuyo y lúcete 🔥",
+    "Sabemos que buscas calidad y tecnología de primer nivel. Por eso, el {brand} es una gran elección. Aquí tienes opciones que se ajustan a distintos planes y necesidades 👇",
+    "Comprar un {brand} es invertir en durabilidad y confianza. Rendimiento estable hoy y por muchos años más. Revisa estos modelos y encuentra el que mejor encaja contigo ✅",
+    "Es el momento perfecto para dar el salto a un {brand}. Innovación, potencia y elegancia en un solo equipo. Mira las opciones disponibles y elige el tuyo ahora ⏳📱",
+    "¡Buenísima elección! El {brand} sigue siendo uno de los celulares más completos del mercado. Te dejo aquí los modelos disponibles para que compares y elijas el ideal para ti 👇",
+]
+
+PHONE_TITLE_EXACT_TEMPLATES = [
+    "¡Qué buena elección! Encontramos el {label}. ¿Cuál te enamora hoy? 😍",
+    "¡Listo! El {label} está aquí. Elige tu favorito y sigue 👇",
+    "Te escuché: buscas el {label}. Compáralos y elige el tuyo ✅",
+    "¡Vamos con el {label}! Mira opciones y avanza con tu compra 🛒",
+    "Aquí tienes el {label} para ti. Elige el ideal y sigue 👉",
+    "Tu búsqueda de el {label} salió perfecta. Revisa y elige 📱",
+    "¡Genial noticia! El {label} disponible. Mira colores y elige el tuyo ✨",
+    "Encontramos el {label} para ti. ¿Listo para decidir? 👇",
+    "Tenemos el {label} en Tienda Claro. Elige tu opción y continúa 🚀",
+    "¿Buscas el {label}? Aquí están los mejores para decidir hoy 🔥",
+]
+
+PHONE_TITLE_SIMILAR_TEMPLATES = [
+"Analizamos tu búsqueda y esto es lo más cercano a lo ideal 💡",
+"Según lo que buscabas, estas opciones tienen mucho sentido 👌",
+"Si miramos tu intención, estas alternativas encajan perfecto 🎯",
+"Esto es lo que elegiría una IA con buen gusto 😌",
+"Opciones alineadas con lo que realmente estabas buscando 🧠"
+]
+
+PHONE_DESC_EXACT_TEMPLATES = [
+    "¡Lo tenemos! El {label} está disponible. Revisa opciones y sigue con tu compra ✅",
+    "¡Excelente noticia! El {label} está aquí. Elige el plan que te conviene y sigue 👇",
+    "Encontramos el {label} para ti. Compara precios y elige tu favorito 📱",
+    "¡Sí hay! El {label} está disponible con opciones de plan. Elige y avanza 🚀",
+    "Tu búsqueda dio resultado: el {label}. Mira detalles y continúa 🛒",
+    "Tenemos el {label} listo para ti. Mira opciones y elige el ideal 👉",
+    "¡Qué bueno! El {label} está disponible. Compara y decide hoy ✨",
+    "Buenas noticias: el {label} está aquí. Elige tu opción y sigue 🔥",
+    "Listo: el {label} está disponible. Revisa colores y planes 👇",
+    "Aquí está el {label}. Elige tu opción favorita y continúa ✅",
+]
+
+PHONE_DESC_SIMILAR_TEMPLATES = [
+    "No encontramos el {label} exacto, pero estas opciones similares te van a encantar. Elige la que más te guste 👇",
+    "No está el {label} exacto, pero hay alternativas muy cercanas. Revisa y elige tu favorita ✅",
+    "No vimos el {label} exacto, pero estas opciones encajan perfecto. Compara y decide 📱",
+    "El {label} exacto no aparece ahora, pero aquí tienes modelos similares para elegir 👇",
+    "No hay coincidencia exacta del {label}, pero estas opciones están buenísimas. Elige y continúa 🛒",
+    "No encontramos el {label} exacto, pero hay alternativas top. Mira y decide 🚀",
+    "No está el {label} exacto por ahora, pero estas opciones son excelentes. Elige la tuya ✨",
+    "No tenemos el {label} exacto, pero estos modelos similares te van a gustar. Elige uno ✅",
+    "No apareció el {label} exacto, pero aquí tienes opciones muy cercanas. Revisa y continúa 👇",
+    "No hay el {label} exacto, pero estas alternativas son ideales para ti. Compara y decide 🔥",
+]
+
+PHONE_DESC_NOT_FOUND_TEMPLATES = [
+    "No encontramos ese modelo exacto, pero aquí tienes alternativas increíbles para elegir 👇",
+    "Por ahora no está ese modelo, pero te dejamos opciones similares para decidir ✅",
+    "No apareció ese modelo exacto, pero estas alternativas pueden encantarte. Mira y elige 📱",
+    "Aún no encontramos ese modelo, pero aquí tienes buenas opciones para continuar 🛒",
+    "No está disponible ese modelo exacto, pero estas opciones están buenísimas. Elige la tuya 🚀",
+    "No vimos ese modelo exacto, pero puedes comparar estas alternativas ahora mismo 👇",
+    "Ese modelo no aparece por ahora, pero estas opciones son muy recomendadas. Elige y sigue ✨",
+    "No encontramos ese modelo exacto, pero hay opciones parecidas para ti. Revisa y decide ✅",
+    "Aún no tenemos ese modelo exacto, pero aquí tienes alternativas top. Compara y elige 🔥",
+    "No está ese modelo exacto en este momento, pero estas opciones pueden encajar perfecto. Mira y continúa 👇",
+]
+
+def _pick_phone_title(label: str, seed: str, templates: List[str]) -> str:
+    digest = hashlib.md5(seed.encode("utf-8")).hexdigest()
+    idx = int(digest, 16) % len(templates)
+    return templates[idx].format(label=label)
+
+def _pick_phone_desc(label: str, seed: str, templates: List[str]) -> str:
+    digest = hashlib.md5(seed.encode("utf-8")).hexdigest()
+    idx = int(digest, 16) % len(templates)
+    desc = templates[idx].format(label=label)
+    follow_ups = [
+        "¿Te gustaría que filtre por color o almacenamiento?",
+        "¿Quieres que te muestre opciones con un plan específico?",
+        "¿Buscas algún color en especial?",
+        "¿Quieres ver alternativas más económicas o premium?",
+        "¿Te gustaría comparar con otro modelo?",
+    ]
+    follow_idx = int(digest, 16) % len(follow_ups)
+    return f"{desc} {follow_ups[follow_idx]}"
+
+def _pick_brand_description(brand_label: str, seed: str) -> str:
+    if not brand_label:
+        return ""
+    digest = hashlib.md5(seed.encode("utf-8")).hexdigest()
+    idx = int(digest, 16) % len(BRAND_RESPONSE_TEMPLATES)
+    return BRAND_RESPONSE_TEMPLATES[idx].format(brand=brand_label)
 
 def _is_brand_only_query(nq: str) -> bool:
     if _match_any(PHONE_MODEL_PATTERNS, nq): return False
@@ -587,6 +804,9 @@ def _query_mentions_economy(nq: str) -> bool:
 
 def _extract_main_number(nq: str) -> Optional[str]:
     m = re.search(r"\b(\d{1,3})\b", nq)
+    if m:
+        return m.group(1)
+    m = re.search(r"[a-z]\s*([0-9]{1,3})", nq)
     return m.group(1) if m else None
 
 def _samsung_series_from_query(nq: str) -> Optional[str]:
@@ -638,11 +858,11 @@ def _pick_by_modality_priority(items: List[dict], k: int = 5, need_porta: int = 
             selected_ids.add(p['id'])
     final_items.extend(portabilidad_selected)
     
-    if len(final_items) < 5:
+    if len(final_items) < k:
         remaining_pool = [r for r in pool_sorted if r['id'] not in selected_ids]
-        final_items.extend(remaining_pool[:5 - len(final_items)])
+        final_items.extend(remaining_pool[:k - len(final_items)])
         
-    return final_items[:5]
+    return final_items[:k]
 
 def _category_hint_from_query(nq: str) -> str:
     s = nq.lower()
@@ -657,7 +877,8 @@ def _category_hint_from_query(nq: str) -> str:
 # ------------------ BQ: Productos ------------------
 def search_products_bq(nq: str, prioritize_plan_79: bool):
     terms = _terms_from_query(nq)
-    if not terms: return [], False, nq
+    #if not terms: return [], False, nq
+    if not terms: return [], False, _display_query_for_phone(nq)
 
     want_prepago = _has_prepago_term(nq)
     explicit_mod = _explicit_modality_from_query(nq)
@@ -665,6 +886,7 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
     cheap = _query_mentions_economy(nq)
     qnum = _extract_main_number(nq)
     series = _samsung_series_from_query(nq)
+    color_key, color_regex = _color_from_query(nq)
 
     canon = _canonical_brand_from_query(nq) or ""
     brand_aliases, brand_kw = [], ""
@@ -740,6 +962,7 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
           @explicit_mod IS NULL OR @explicit_mod = '' OR
           LOWER(IFNULL(modality,'')) = LOWER(@explicit_mod)
         )
+        AND (@color_regex = '' OR REGEXP_CONTAINS(LOWER(IFNULL(title_product,'')), @color_regex))
     ),
     enriched_base AS (
       SELECT
@@ -921,6 +1144,7 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
             bigquery.ArrayQueryParameter("other_terms", "STRING", other_terms),
             bigquery.ScalarQueryParameter("storage", "STRING", storage),
             bigquery.ScalarQueryParameter("cheap", "BOOL", cheap),
+            bigquery.ScalarQueryParameter("color_regex", "STRING", color_regex or ""),
             bigquery.ScalarQueryParameter("want_pro_max", "INT64", want_pro_max),
             bigquery.ScalarQueryParameter("want_pro", "INT64", want_pro),
             bigquery.ScalarQueryParameter("want_ultra", "INT64", want_ultra),
@@ -968,6 +1192,7 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
               @force_prepago = TRUE
               OR LOWER(IFNULL(modality,'')) IN ('portabilidad','renovación','renovacion')
             )
+            AND (@color_regex = '' OR REGEXP_CONTAINS(LOWER(IFNULL(title_product,'')), @color_regex))
         ),
         enriched AS (
           SELECT
@@ -1025,6 +1250,7 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
         FROM e
         WHERE
           REGEXP_CONTAINS(title_norm, r'(^|[^0-9])(' || ARRAY_TO_STRING(@near_nums, '|') || r')([^0-9]|$)')
+          AND (@color_regex = '' OR REGEXP_CONTAINS(title_norm, @color_regex))
         ORDER BY COALESCE(price_list,9e18) ASC
         LIMIT 20
         """
@@ -1032,6 +1258,7 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
             query_parameters=[
                 bigquery.ArrayQueryParameter("brand_aliases", "STRING", brand_aliases or []),
                 bigquery.ArrayQueryParameter("near_nums", "STRING", near_nums),
+                bigquery.ScalarQueryParameter("color_regex", "STRING", color_regex or ""),
             ]
         )
         near_rows = list(bq_client.query(near_sql, job_config=jc2).result())
@@ -1041,19 +1268,243 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
 
     cand = []
     for r in rows:
+        title_full = r["title_product"] or ""
+        line_val = (r["line"] or "")
+        modality_val = (r["modality"] or "")
+        plan_val = (r["title_plan"] or "")
         cand.append({
             "id": r["id"], "marca": r["brand"], 
-            "producto": r["title_product"][:38],
+            #"producto": r["title_product"][:38],
+            "producto": title_full[:38],
             "imagen": r["image"],
             "url": r["calltoaction_url"], "tipo": "Celular",
             "plan": r["title_plan"], "price_list": r["price_list"], "discount": r["discount"],
             "porcentaje_descuento": None, "line": r["line"], "modality": r["modality"], "financing": r["financing"],
+            "_color": _extract_color_from_title(title_full),
+            "_storage": _extract_storage_from_title(title_full),
+            "_model": _extract_model_number_from_title(title_full, canon),
+            "_variant": _variant_rank(title_full),
+            "_is_7990": bool(
+                line_val.lower() == "postpago"
+                and re.search(r'\bmax\b.*\bilimitado\b.*\b79[\.,]90\b', plan_val.lower() or "")
+                and re.search(r"(portabilidad|renovacion|renovación)", modality_val.lower())
+            ),
         })
 
     allowed = None if explicit_mod else ["Portabilidad","Renovación"] if not want_prepago else None
-    top = _pick_by_modality_priority(cand, k=5, need_porta=2, allowed_modalities=allowed)
-    return top, had_exact, nq
 
+    top = _pick_by_modality_priority(cand, k=24, need_porta=2, allowed_modalities=allowed)
+    require_strict_plan = not explicit_mod and not want_prepago
+    if require_strict_plan:
+        strict_top = [item for item in top if item.get("_is_7990")]
+        if strict_top:
+            top = strict_top
+
+    model_specific = bool(qnum) or _match_any(PHONE_MODEL_PATTERNS, nq)
+    storage_requested = bool(storage)
+    target_model = int(qnum) if (qnum and qnum.isdigit()) else None
+    candidates = top
+
+    if model_specific and target_model:
+        same_model = [c for c in candidates if c.get("_model") == target_model]
+        if storage_requested:
+            same_model = sorted(same_model, key=lambda x: x.get("_storage", 0), reverse=True)
+        else:
+            same_model = sorted(same_model, key=lambda x: (x.get("_variant", 0), x.get("_storage", 0)), reverse=True)
+
+        def _pick_colors(pool, limit):
+            picked, seen = [], set()
+            for item in pool:
+                color = item.get("_color") or ""
+                if color and color in seen:
+                    continue
+                picked.append(item)
+                if color:
+                    seen.add(color)
+                if len(picked) >= limit:
+                    break
+            return picked
+
+        def _pick_models_colors(pool, limit):
+            picked, seen_models, seen_pairs = [], set(), set()
+            for item in pool:
+                model = item.get("_model") or 0
+                color = item.get("_color") or ""
+                if model and model in seen_models:
+                    continue
+                if color and (model, color) in seen_pairs:
+                    continue
+                picked.append(item)
+                if model:
+                    seen_models.add(model)
+                if color:
+                    seen_pairs.add((model, color))
+                if len(picked) >= limit:
+                    break
+            return picked
+
+        selected = _pick_colors(same_model, 5)
+        if len(selected) < 5:
+            variants = [c for c in same_model if c not in selected]
+            selected.extend(variants[:5 - len(selected)])
+
+        if len(selected) < 5:
+            nearby = [c for c in candidates if c.get("_model") and c.get("_model") != target_model]
+            nearby = sorted(nearby, key=lambda x: x.get("_model", 0), reverse=True)
+            selected.extend(_pick_models_colors(nearby, 5 - len(selected)))
+
+    else:
+        candidates = sorted(candidates, key=lambda x: (x.get("_model", 0), x.get("_variant", 0)), reverse=True)
+        selected, seen_pairs = [], set()
+        for item in candidates:
+            color = item.get("_color") or ""
+            model = item.get("_model") or 0
+            if color and (model, color) in seen_pairs:
+                continue
+            selected.append(item)
+            if color:
+                seen_pairs.add((model, color))
+            if len(selected) >= 5:
+                break
+
+    if len(selected) < 5:
+        for item in candidates:
+            if item in selected:
+                continue
+            selected.append(item)
+            if len(selected) >= 5:
+                break
+
+    top = [{k: v for k, v in item.items() if not k.startswith("_")} for item in selected[:5]]
+    return top, had_exact, _display_query_for_phone(nq)
+
+def search_brand_only_bq(nq_brand: str) -> List[dict]:
+    brand_focus = _canonical_brand_from_query(nq_brand)
+    if not brand_focus:
+        return []
+
+    if brand_focus == "apple":
+        brand_aliases, brand_kw = ["apple","iphone"], "iphone"
+    elif brand_focus == "samsung":
+        brand_aliases, brand_kw = ["samsung","galaxy","samsung mobile","samsung electronics"], "galaxy"
+    elif brand_focus == "motorola":
+        brand_aliases, brand_kw = ["motorola","moto"], "moto"
+    elif brand_focus == "xiaomi":
+        brand_aliases, brand_kw = ["xiaomi","redmi","poco"], "xiaomi"
+    elif brand_focus == "google":
+        brand_aliases, brand_kw = ["google","pixel"], "pixel"
+    else:
+        brand_aliases, brand_kw = [brand_focus], brand_focus
+
+    sql = f"""
+    SELECT
+      id, brand, title_product, image, calltoaction_url, line, modality, financing,
+      title_plan,
+      SAFE_CAST(NULLIF(CAST(price_list AS STRING), '') AS FLOAT64) AS price_list,
+      SAFE_CAST(NULLIF(CAST(discount AS STRING), '') AS FLOAT64)   AS discount
+    FROM `{BQ_TABLE_PRODUCTS}`
+    WHERE
+      (
+        LOWER(TRIM(IFNULL(brand,''))) IN UNNEST(@brand_aliases)
+        OR (@brand_kw != '' AND STRPOS(LOWER(IFNULL(title_product,'')), @brand_kw) > 0)
+      )
+      AND LOWER(IFNULL(line,'')) IN ('postpago','prepago')
+      AND REGEXP_CONTAINS(LOWER(IFNULL(modality,'')), r'(portabilidad|renovacion|renovación)')
+      AND REGEXP_CONTAINS(LOWER(IFNULL(title_plan,'')), r'\\bmax[[:space:]]+ilimitado\\b')
+      AND REGEXP_CONTAINS(LOWER(IFNULL(title_plan,'')), r'\\b79[\\., ]?90\\b')
+    LIMIT 120
+    """
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter("brand_aliases", "STRING", brand_aliases),
+            bigquery.ScalarQueryParameter("brand_kw", "STRING", brand_kw),
+        ]
+    )
+    rows = list(bq_client.query(sql, job_config=job_config).result())
+    if not rows:
+        relaxed_sql = f"""
+        SELECT
+          id, brand, title_product, image, calltoaction_url, line, modality, financing,
+          title_plan,
+          SAFE_CAST(NULLIF(CAST(price_list AS STRING), '') AS FLOAT64) AS price_list,
+          SAFE_CAST(NULLIF(CAST(discount AS STRING), '') AS FLOAT64)   AS discount
+        FROM `{BQ_TABLE_PRODUCTS}`
+        WHERE
+          (
+            LOWER(TRIM(IFNULL(brand,''))) IN UNNEST(@brand_aliases)
+            OR (@brand_kw != '' AND STRPOS(LOWER(IFNULL(title_product,'')), @brand_kw) > 0)
+          )
+          AND LOWER(IFNULL(line,'')) IN ('postpago','prepago')
+          AND REGEXP_CONTAINS(LOWER(IFNULL(modality,'')), r'(portabilidad|renovacion|renovación)')
+        LIMIT 120
+        """
+        rows = list(bq_client.query(relaxed_sql, job_config=job_config).result())
+    if not rows:
+        return []
+
+    def _normalize_model_key(title: str) -> str:
+        cleaned = strip_accents((title or "").lower())
+        cleaned = re.sub(r"\b\d{2,4}\s*gb\b", "", cleaned)
+        cleaned = re.sub(r"\b(5g|4g)\b", "", cleaned)
+        cleaned = re.sub(
+            r"\b(black|blue|white|green|gold|pink|silver|gray|grey|titanium|natural|negro|azul|blanco|verde|dorado|rosa|plata|gris|titanio|graphite|awesome)\b",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(r"[^a-z0-9 ]", " ", cleaned)
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    candidates = []
+    for r in rows:
+        title_full = r["title_product"] or ""
+        candidates.append({
+            "id": r["id"], "marca": r["brand"],
+            "producto": title_full[:38],
+            "imagen": r["image"],
+            "url": r["calltoaction_url"], "tipo": "Celular",
+            "plan": r["title_plan"], "price_list": r["price_list"], "discount": r["discount"],
+            "line": r["line"], "modality": r["modality"], "financing": r["financing"],
+            "_model": _extract_model_number_from_title(title_full, brand_focus),
+            "_variant": _variant_rank(title_full),
+            "_storage": _extract_storage_from_title(title_full),
+            "_color": _extract_color_from_title(title_full),
+            "_model_key": _normalize_model_key(title_full),
+        })
+
+    candidates.sort(key=lambda x: (x["_model"], x.get("_variant", 0), x["_storage"]), reverse=True)
+
+    dedupe_by_variant = brand_focus != "samsung"
+    picked, seen_keys, seen_pairs, seen_model_keys = [], set(), set(), set()
+    for item in candidates:
+        variant_key = item.get("_variant", 0) if dedupe_by_variant else 0
+        model_key = item.get("_model_key") or ""
+        key = (item["_model"], variant_key)
+        if item["_model"] and key in seen_keys:
+            continue
+        if brand_focus == "samsung" and model_key and model_key in seen_model_keys:
+            continue
+        if item["_color"] and (item["_model"], variant_key, item["_color"]) in seen_pairs:
+            continue
+        picked.append(item)
+        if item["_model"]:
+            seen_keys.add(key)
+        if item["_color"]:
+            seen_pairs.add((item["_model"], variant_key, item["_color"]))
+        if model_key:
+            seen_model_keys.add(model_key)
+        if len(picked) >= 5:
+            break
+
+    if len(picked) < 5:
+        for item in candidates:
+            if item in picked:
+                continue
+            picked.append(item)
+            if len(picked) >= 5:
+                break
+
+    return [{k: v for k, v in item.items() if not k.startswith("_")} for item in picked[:5]]
 # ------------------ BQ: Marca-solo (TOP5 último mes) ------------------
 # [SECCION REINTEGRADA: AUXILIARES PARA TOP 5 MARCAS]
 def _last_closed_month_start_date_lima() -> datetime.date:
@@ -1647,16 +2098,23 @@ def query_dev():
     user_agent = request.headers.get("User-Agent", "")
     pregunta_timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-    cors_resp = origin_check(
-        request,
-        allowed=[
-            "https://www.claro.com.pe",
-            "https://test-claro-pe.prod.clarodigital.net",
-            "https://search-test-1079186964678.us-central1.run.app",
-        ],
-    )
-    if cors_resp:
-        return cors_resp
+#    cors_resp = origin_check(
+#        request,
+#        allowed=[
+#            "https://www.claro.com.pe",
+#            "https://test-claro-pe.prod.clarodigital.net",
+#            "https://search-test-1079186964678.us-central1.run.app",
+#            "https://search-api-1079186964678.us-central1.run.app",
+#            "https://genia-front-test-1079186964678.us-central1.run.app",
+#        ],
+#    )
+#    if cors_resp:
+#        return cors_resp
+    if os.environ.get("DEV_ORIGIN_CHECK", "false").lower() == "true":
+        cors_resp = origin_check(request, allowed=DEV_ALLOWED_ORIGINS)
+        if cors_resp:
+            return cors_resp
+
 
     if not user_query:
         return jsonify({"error": "El parámetro 'q' es requerido"}), 400
@@ -1665,6 +2123,8 @@ def query_dev():
 
     try:
         normalized_query, category = classify_with_gemini(user_query)
+        if category == "celulares":
+            normalized_query = _strip_fillers_from_query(normalized_query)
 
         # category = clasificador(normalized_query)
 
@@ -1698,7 +2158,8 @@ def query_dev():
         uso_cache = False
         
         # [FIX CRÍTICO]: brand_name definido antes
-        brand_name = _canonical_brand_from_query(normalized_query) 
+        brand_name = _canonical_brand_from_query(normalized_query)
+        display_phone_query = _display_query_for_phone(normalized_query) 
 
         if category == "general":
             cache = buscar_respuesta_definitiva(normalized_query)
@@ -1708,26 +2169,20 @@ def query_dev():
         
         # [FIX CRÍTICO]: Cache para Planes
         if respuesta is None and category == "planes":
-            cache = buscar_respuesta_definitiva(normalized_query)
-            if cache:
-                uso_cache = True
-                respuesta = json.loads(cache)
-            else:
-                planes = search_plans_bq(normalized_query)
-                plan_type = "Postpago" if not _has_prepago_term(normalized_query) and 'postpago' in normalized_query.lower() else "Prepago"
-                general_response = get_summary_from_vertex(normalized_query)
+            planes = search_plans_bq(normalized_query)
+            plan_type = "Postpago" if not _has_prepago_term(normalized_query) and 'postpago' in normalized_query.lower() else "Prepago"
+            general_response = get_summary_from_vertex(normalized_query)
 
-                respuesta = {
-                    "titulo": general_response.get("titulo", f"Planes Móviles {plan_type} Claro"),
-                    "descripcion": general_response.get("descripcion", f"¡Descubre la libertad y beneficios de nuestros planes {plan_type} Claro!"),
-                    "planes": planes,
-                    "listado": general_response.get("listado", []),
-                    "relacionados": general_response.get("relacionados", []),
-                    "status": "Found" if planes or general_response.get("status") == "Found" else "Not Found",
-                    "query": normalized_query,
-                    "tipo_respuesta": "general",
-                }
-                guardar_en_respuestas_definitivas(normalized_query, respuesta)
+            respuesta = {
+                "titulo": general_response.get("titulo", f"Planes Móviles {plan_type} Claro"),
+                "descripcion": general_response.get("descripcion", f"¡Descubre la libertad y beneficios de nuestros planes {plan_type} Claro!"),
+                "planes": planes,
+                "listado": general_response.get("listado", []),
+                "relacionados": general_response.get("relacionados", []),
+                "status": "Found" if planes or general_response.get("status") == "Found" else "Not Found",
+                "query": normalized_query,
+                "tipo_respuesta": "general",
+            }
             
             respuesta["_meta"] = {"normalized_query": normalized_query, "category": category, "cache_hit": uso_cache}
             guardar_pregunta_en_historial(normalized_query, sia_id, respuesta, pregunta_timestamp, user_agent)
@@ -1775,14 +2230,16 @@ def query_dev():
         
         if respuesta is None:
             if category == "celulares" and only_brand_corrected:
-                top5_brand_items, mes_label = search_brand_top5_products(normalized_query)
-                if top5_brand_items:
+                brand_items = search_brand_only_bq(normalized_query)
+                if brand_items:
                     accesorios = search_accessories_bq(normalized_query)
-                    brand_cap = _canonical_brand_from_query(normalized_query).capitalize()
+                    #brand_cap = _canonical_brand_from_query(normalized_query).capitalize()
+                    brand_cap = _brand_display_label(normalized_query) or display_phone_query
+                    brand_desc = _pick_brand_description(brand_cap, normalized_query)
                     respuesta = {
-                        "titulo": f"¡Los Más Vendidos de {brand_cap} en Claro!",
-                        "descripcion": f"Descubre los equipos más populares de {brand_cap}. ¡Tendencias de {mes_label}! Llévalo con un Plan Max Ilimitado 79.90.",
-                        "producto": top5_brand_items,
+                        "titulo": f"Lo mas vendido de {brand_cap} !😍",
+                        "descripcion": brand_desc,
+                        "producto": brand_items,
                         "recomendados": accesorios if accesorios else DEFAULT_RECOMMENDATIONS,
                         "status": "Found",
                         "tipo_respuesta": "tienda",
@@ -1796,17 +2253,36 @@ def query_dev():
                     normalized_query,
                     prioritize_plan_79=(category == "celulares")
                 )
+                if brand_name:
+                    if not topN:
+                        topN = search_brand_only_bq(normalized_query)
+                    elif len(topN) < 5:
+                        brand_fallback = search_brand_only_bq(normalized_query)
+                        if brand_fallback:
+                            existing_ids = {item.get("id") for item in topN}
+                            for item in brand_fallback:
+                                if len(topN) >= 5:
+                                    break
+                                if item.get("id") in existing_ids:
+                                    continue
+                                topN.append(item)
+                                existing_ids.add(item.get("id"))
                 accesorios = search_accessories_bq(normalized_query)
                 recomendados = accesorios if accesorios else DEFAULT_RECOMMENDATIONS
                 
                 if topN:
                     if had_exact:
-                        desc = f"¡Lo tenemos! El {wanted_label.title()} te espera con ofertas exclusivas en planes de renovación y portabilidad." 
+                        #desc = f"¡Lo tenemos! El {wanted_label.title()} te espera con ofertas exclusivas en planes de renovación y portabilidad." 
+                        #desc = f"🔥 ¡Buenísima elección! Sí tenemos el {wanted_label} en Tienda Claro, te espera con ofertas exclusivas en planes de renovación y portabilidad."                     
+                        desc = _pick_phone_desc(wanted_label, normalized_query, PHONE_DESC_EXACT_TEMPLATES)                    
                     else:
-                        desc = f"¡Te mostramos opciones irresistibles! No tenemos el {wanted_label.title()} exacto, pero estos modelos similares te encantarán."
-                    
+                        #desc = f"¡Te mostramos opciones irresistibles! No tenemos el {wanted_label.title()} exacto, pero estos modelos similares te encantarán."
+                        #desc = f"¡Te mostramos opciones irresistibles! No tenemos el {wanted_label} exacto, pero estos modelos similares te encantarán."  
+                        desc = _pick_phone_desc(wanted_label, normalized_query, PHONE_DESC_SIMILAR_TEMPLATES) 
+
+                    title_templates = PHONE_TITLE_EXACT_TEMPLATES if had_exact else PHONE_TITLE_SIMILAR_TEMPLATES                   
                     respuesta = {
-                        "titulo": f"¡Encuentra tu {wanted_label.title()} en Tienda Claro!",
+                        "titulo": _pick_phone_title(wanted_label, normalized_query, title_templates),
                         "descripcion": desc,
                         "producto": topN,
                         "recomendados": recomendados,
@@ -1815,8 +2291,10 @@ def query_dev():
                     }
                 else:
                     respuesta = {
-                        "titulo": f"Ups, no encontramos el modelo {normalized_query.title()}",
-                        "descripcion": f"No encontramos ese modelo exacto, pero mira estas alternativas increíbles o explora nuestras recomendaciones:",
+#                        "titulo": f"Ups, no encontramos el modelo {normalized_query.title()}",
+#                        "descripcion": f"No encontramos ese modelo exacto, pero mira estas alternativas increíbles o explora nuestras recomendaciones:",
+                        "titulo": f"Ups, no encontramos el modelo {display_phone_query}",
+                        "descripcion": _pick_phone_desc(display_phone_query, normalized_query, PHONE_DESC_NOT_FOUND_TEMPLATES),
                         "producto": [],
                         "recomendados": recomendados,
                         "status": "Not Found",
