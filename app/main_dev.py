@@ -637,6 +637,7 @@ def _variant_rank(title: str) -> int:
         return 1
     return 0
 
+
 def _brand_display_label(nq: str) -> Optional[str]:
     s = nq.lower()
     if "iphone" in s: return "iPhone"
@@ -756,11 +757,7 @@ def _pick_phone_desc(label: str, seed: str, templates: List[str]) -> str:
     idx = int(digest, 16) % len(templates)
     desc = templates[idx].format(label=label)
     follow_ups = [
-        "¿Te gustaría que filtre por color o almacenamiento?",
-        "¿Quieres que te muestre opciones con un plan específico?",
-        "¿Buscas algún color en especial?",
-        "¿Quieres ver alternativas más económicas o premium?",
-        "¿Te gustaría comparar con otro modelo?",
+        ""
     ]
     follow_idx = int(digest, 16) % len(follow_ups)
     return f"{desc} {follow_ups[follow_idx]}"
@@ -869,7 +866,7 @@ def _category_hint_from_query(nq: str) -> str:
     if "ipad" in s: return "ipad"
     if "tablet" in s: return "tablet"
     if "smartwatch" in s or "reloj inteligente" in s or "watch" in s: return "smartwatch"
-    if "power bank" in s or "powerbank" in s or "bateria externa" in s or "batería externa" in s: return "powerbank"
+    if "power bank" in s or "powerbank" in s or "bateria externa" in s or "batería externa" in s or "cargador portatil" in s or "cargador portátil" in s: return "powerbank"
     if "cargador" in s and ("inalambr" in s or "inalámbr" in s): return "charg_wireless"
     if "audifono" in s or "audifonos" in s or "audífono" in s or "audífonos" in s or "earbuds" in s or "airpods" in s or "earpods" in s or "auriculares" in s: return "headphones"
     return ""
@@ -1303,14 +1300,53 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
     model_specific = bool(qnum) or _match_any(PHONE_MODEL_PATTERNS, nq)
     storage_requested = bool(storage)
     target_model = int(qnum) if (qnum and qnum.isdigit()) else None
-    candidates = top
+    #candidates = top
+    candidates = cand if model_specific and target_model else top
+
 
     if model_specific and target_model:
         same_model = [c for c in candidates if c.get("_model") == target_model]
+        desired_variant = None
+        if want_pro_max:
+            desired_variant = 3
+        elif want_pro:
+            desired_variant = 2
+        elif want_plus:
+            desired_variant = 1
+
+        preferred_same_model = same_model
+        if desired_variant is not None:
+            preferred_same_model = [c for c in same_model if c.get("_variant") == desired_variant]
+        elif desired_variant is None:
+            base_only = [c for c in same_model if c.get("_variant") == 0]
+            if base_only:
+                preferred_same_model = base_only
+
+        def _variant_preference(item: dict) -> Tuple[int, int, int]:
+            variant = item.get("_variant", 0)
+            if desired_variant is None:
+                match = 1 if variant == 0 else 0
+                return (match, -variant, item.get("_storage", 0))
+            match = 1 if variant == desired_variant else 0
+            return (match, variant, item.get("_storage", 0))
+
         if storage_requested:
-            same_model = sorted(same_model, key=lambda x: x.get("_storage", 0), reverse=True)
+            same_model = sorted(
+                same_model,
+                key=lambda x: (_variant_preference(x), x.get("_storage", 0)),
+                reverse=True,
+            )
+            preferred_same_model = sorted(
+                preferred_same_model,
+                key=lambda x: (_variant_preference(x), x.get("_storage", 0)),
+                reverse=True,
+            )
+            #same_model = sorted(same_model, key=lambda x: x.get("_storage", 0), reverse=True)
         else:
-            same_model = sorted(same_model, key=lambda x: (x.get("_variant", 0), x.get("_storage", 0)), reverse=True)
+#            same_model = sorted(same_model, key=lambda x: (x.get("_variant", 0), x.get("_storage", 0)), reverse=True)
+            #same_model = sorted(same_model, key=_variant_preference, reverse=True)
+            same_model = sorted(same_model, key=_variant_preference, reverse=True)
+            preferred_same_model = sorted(preferred_same_model, key=_variant_preference, reverse=True)
 
         def _pick_colors(pool, limit):
             picked, seen = [], set()
@@ -1343,7 +1379,7 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
                     break
             return picked
 
-        selected = _pick_colors(same_model, 5)
+        selected = _pick_colors(preferred_same_model, 5)
         if len(selected) < 5:
             variants = [c for c in same_model if c not in selected]
             selected.extend(variants[:5 - len(selected)])
@@ -1409,6 +1445,7 @@ def search_brand_only_bq(nq_brand: str) -> List[dict]:
         OR (@brand_kw != '' AND STRPOS(LOWER(IFNULL(title_product,'')), @brand_kw) > 0)
       )
       AND LOWER(IFNULL(line,'')) IN ('postpago','prepago')
+      AND LOWER(IFNULL(financing,'')) = 'Al contado'
       AND REGEXP_CONTAINS(LOWER(IFNULL(modality,'')), r'(portabilidad|renovacion|renovación)')
       AND REGEXP_CONTAINS(LOWER(IFNULL(title_plan,'')), r'\\bmax[[:space:]]+ilimitado\\b')
       AND REGEXP_CONTAINS(LOWER(IFNULL(title_plan,'')), r'\\b79[\\., ]?90\\b')
@@ -1436,12 +1473,38 @@ def search_brand_only_bq(nq_brand: str) -> List[dict]:
             OR (@brand_kw != '' AND STRPOS(LOWER(IFNULL(title_product,'')), @brand_kw) > 0)
           )
           AND LOWER(IFNULL(line,'')) IN ('postpago','prepago')
+          AND LOWER(IFNULL(financing,'')) = 'Al contado'
           AND REGEXP_CONTAINS(LOWER(IFNULL(modality,'')), r'(portabilidad|renovacion|renovación)')
         LIMIT 120
         """
         rows = list(bq_client.query(relaxed_sql, job_config=job_config).result())
+
+    if not rows:
+        cash_sql = f"""
+        SELECT
+          id, brand, title_product, image, calltoaction_url, line, modality, financing,
+          title_plan,
+          SAFE_CAST(NULLIF(CAST(price_list AS STRING), '') AS FLOAT64) AS price_list,
+          SAFE_CAST(NULLIF(CAST(discount AS STRING), '') AS FLOAT64)   AS discount
+        FROM `{BQ_TABLE_PRODUCTS}`
+        WHERE
+          (
+            LOWER(TRIM(IFNULL(brand,''))) IN UNNEST(@brand_aliases)
+            OR (@brand_kw != '' AND STRPOS(LOWER(IFNULL(title_product,'')), @brand_kw) > 0)
+          )
+          AND LOWER(IFNULL(line,'')) = 'postpago'
+          AND LOWER(IFNULL(financing,'')) = 'al contado'
+          AND REGEXP_CONTAINS(LOWER(IFNULL(modality,'')), r'(renovacion|renovación)')
+          AND REGEXP_CONTAINS(LOWER(IFNULL(title_plan,'')), r'\\bmax[[:space:]]+ilimitado\\b')
+          AND REGEXP_CONTAINS(LOWER(IFNULL(title_plan,'')), r'\\b79[\\., ]?90\\b')
+        LIMIT 120
+        """
+        rows = list(bq_client.query(cash_sql, job_config=job_config).result())
+
     if not rows:
         return []
+    
+
 
     def _normalize_model_key(title: str) -> str:
         cleaned = strip_accents((title or "").lower())
@@ -1453,7 +1516,14 @@ def search_brand_only_bq(nq_brand: str) -> List[dict]:
             cleaned,
         )
         cleaned = re.sub(r"[^a-z0-9 ]", " ", cleaned)
+        cleaned = re.sub(r"([a-z])([0-9])", r"\1 \2", cleaned)
+        cleaned = re.sub(r"([0-9])([a-z])", r"\1 \2", cleaned)
         return re.sub(r"\s+", " ", cleaned).strip()
+    
+    def _normalize_title_key(title: str) -> str:
+        cleaned = strip_accents((title or "").lower())
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
 
     candidates = []
     for r in rows:
@@ -1470,19 +1540,35 @@ def search_brand_only_bq(nq_brand: str) -> List[dict]:
             "_storage": _extract_storage_from_title(title_full),
             "_color": _extract_color_from_title(title_full),
             "_model_key": _normalize_model_key(title_full),
+            "_title_key": _normalize_title_key(title_full),
         })
 
-    candidates.sort(key=lambda x: (x["_model"], x.get("_variant", 0), x["_storage"]), reverse=True)
+    #candidates.sort(key=lambda x: (x["_model"], x.get("_variant", 0), x["_storage"]), reverse=True)
+    candidates.sort(
+        key=lambda x: (
+            x["_model"],
+            x.get("_variant", 0),
+            x["_storage"],
+            x.get("price_list") if x.get("price_list") is not None else -1,
+        ),
+        reverse=True,
+    )
 
     dedupe_by_variant = brand_focus != "samsung"
-    picked, seen_keys, seen_pairs, seen_model_keys = [], set(), set(), set()
+    #picked, seen_keys, seen_pairs, seen_model_keys = [], set(), set(), set()
+    picked, seen_keys, seen_pairs, seen_model_keys, seen_titles = [], set(), set(), set(), set()
     for item in candidates:
         variant_key = item.get("_variant", 0) if dedupe_by_variant else 0
         model_key = item.get("_model_key") or ""
+        title_key = item.get("_title_key") or ""
         key = (item["_model"], variant_key)
         if item["_model"] and key in seen_keys:
             continue
-        if brand_focus == "samsung" and model_key and model_key in seen_model_keys:
+        #if brand_focus == "samsung" and model_key and model_key in seen_model_keys:
+        #    continue
+        if model_key and model_key in seen_model_keys:
+            continue
+        if title_key and title_key in seen_titles:
             continue
         if item["_color"] and (item["_model"], variant_key, item["_color"]) in seen_pairs:
             continue
@@ -1493,6 +1579,8 @@ def search_brand_only_bq(nq_brand: str) -> List[dict]:
             seen_pairs.add((item["_model"], variant_key, item["_color"]))
         if model_key:
             seen_model_keys.add(model_key)
+        if title_key:
+            seen_titles.add(title_key)
         if len(picked) >= 5:
             break
 
@@ -1500,9 +1588,30 @@ def search_brand_only_bq(nq_brand: str) -> List[dict]:
         for item in candidates:
             if item in picked:
                 continue
+            variant_key = item.get("_variant", 0) if dedupe_by_variant else 0
+            model_key = item.get("_model_key") or ""
+            title_key = item.get("_title_key") or ""
+            key = (item.get("_model"), variant_key)
+            if item.get("_model") and key in seen_keys:
+                continue
+            if model_key and model_key in seen_model_keys:
+                continue
+            if title_key and title_key in seen_titles:
+                continue
             picked.append(item)
+            if item.get("_model"):
+                seen_keys.add(key)
+            if model_key:
+                seen_model_keys.add(model_key)
+            if title_key:
+                seen_titles.add(title_key)
             if len(picked) >= 5:
                 break
+
+    picked.sort(
+        key=lambda x: x.get("price_list") if x.get("price_list") is not None else -1,
+        reverse=True,
+    )
 
     return [{k: v for k, v in item.items() if not k.startswith("_")} for item in picked[:5]]
 # ------------------ BQ: Marca-solo (TOP5 último mes) ------------------
@@ -1883,15 +1992,22 @@ def search_accessories_bq(nq: str) -> List[dict]:
         return []
     brand_focus = _canonical_brand_from_query(nq)
     cat_hint = _category_hint_from_query(nq)
+    wants_brand_diversity = cat_hint in {"headphones", "powerbank"}
+    apple_audio_only = bool(re.search(r"\b(airpods|earpods)\b", nq.lower()))
 
     unique_items = {}
+
+    if apple_audio_only:
+        brand_focus = "apple"
+        wants_brand_diversity = False
     
     if brand_focus:
-        res_brand = _run_accessories_query(terms, brand_focus=brand_focus, require_brand=True, strict_brand=False, cat_hint=cat_hint)
+        #res_brand = _run_accessories_query(terms, brand_focus=brand_focus, require_brand=True, strict_brand=False, cat_hint=cat_hint)
+        res_brand = _run_accessories_query(terms, brand_focus=brand_focus, require_brand=True, strict_brand=apple_audio_only, cat_hint=cat_hint)
         for item in res_brand:
             unique_items.setdefault(item['id'], item)
 
-    if cat_hint:
+    if cat_hint and not apple_audio_only:
         res_generic_cat = _run_accessories_query(terms, brand_focus=None, require_brand=False, strict_brand=False, cat_hint=cat_hint)
         for item in res_generic_cat:
             unique_items.setdefault(item['id'], item)
@@ -1903,7 +2019,47 @@ def search_accessories_bq(nq: str) -> List[dict]:
 
     final_list = list(unique_items.values())
     final_list.sort(key=lambda x: (x.get('match_score', 0) if isinstance(x, dict) else 0, x.get('porcentaje_descuento') or 0), reverse=True)
-    
+
+    if wants_brand_diversity:
+        preferred_brands = ["lenovo", "apple", "samsung", "xiaomi", "oppo", "motorola", "huawei", "honor", "realme", "vivo"]
+        buckets = {}
+        for item in final_list:
+            brand = (item.get("marca") or "").strip().lower()
+            bucket_key = brand if brand else "otros"
+            buckets.setdefault(bucket_key, []).append(item)
+
+        result = []
+        used_ids = set()
+        for brand in preferred_brands:
+            if brand in buckets:
+                for item in buckets[brand]:
+                    if item["id"] in used_ids:
+                        continue
+                    result.append(item)
+                    used_ids.add(item["id"])
+                    break
+            if len(result) >= 5:
+                break
+
+        if len(result) < 5:
+            for brand, items in buckets.items():
+                if brand in preferred_brands:
+                    continue
+                for item in items:
+                    if item["id"] in used_ids:
+                        continue
+                    result.append(item)
+                    used_ids.add(item["id"])
+                    break
+                if len(result) >= 5:
+                    break
+
+        if len(result) < 5:
+            remaining_pool = [item for item in final_list if item["id"] not in used_ids]
+            result.extend(remaining_pool[:5 - len(result)])
+
+        return result[:5]
+
     result_final, used_ids, selected_categories = [], set(), set()
     ACCESSORY_TYPE_MAPPER = {
         'headphones': ['audifonos', 'earbuds', 'airpods', 'earpods','auriculares'],
@@ -2048,7 +2204,7 @@ def build_claro_video_response(normalized_query: str) -> dict:
 
     first_movie = main_movies[0]
     titulo_pelicula = (first_movie.get("title") or first_movie.get("title_original") or "esta película")
-    titulo_marketero = f"¡Disfruta «{titulo_pelicula}» en Claro Video!"
+    titulo_marketero = f"¡Disfruta {titulo_pelicula} en Claro Video!"
 
     listado = []
     for m in main_movies:
@@ -2189,6 +2345,7 @@ def query_dev():
             return jsonify(respuesta)
 
         if respuesta is None and category == "tienda_productos":
+            cleaned_query = _strip_fillers_from_query(normalized_query)
             producto_tp = search_accessories_bq(normalized_query)
             if brand_name == "lenovo":
                 respuesta = {
@@ -2201,7 +2358,7 @@ def query_dev():
                 }
             elif producto_tp:
                 respuesta = {
-                    "titulo": f"¡Encontramos {normalized_query.title()} para ti!",
+                    "titulo": f"¡Encontramos {cleaned_query.title()} para ti!",
                     "descripcion": "¡Potencia tu mundo con la mejor tecnología! Mira estas opciones irresistibles.",
                     "producto": producto_tp,
                     "recomendados": DEFAULT_RECOMMENDATIONS,
@@ -2233,6 +2390,10 @@ def query_dev():
                 brand_items = search_brand_only_bq(normalized_query)
                 if brand_items:
                     accesorios = search_accessories_bq(normalized_query)
+                    if not accesorios and brand_name in {"oppo", "xiaomi","zte","motorola"}:
+                        accesorios = search_accessories_bq("cargador")
+                        if not accesorios:
+                            accesorios = search_accessories_bq("audifonos")
                     #brand_cap = _canonical_brand_from_query(normalized_query).capitalize()
                     brand_cap = _brand_display_label(normalized_query) or display_phone_query
                     brand_desc = _pick_brand_description(brand_cap, normalized_query)
@@ -2268,6 +2429,11 @@ def query_dev():
                                 topN.append(item)
                                 existing_ids.add(item.get("id"))
                 accesorios = search_accessories_bq(normalized_query)
+                if not accesorios and brand_name in {"oppo", "xiaomi","zte","motorola"}:
+                    accesorios = search_accessories_bq("cargador")
+                    if not accesorios:
+                        accesorios = search_accessories_bq("audifonos")
+
                 recomendados = accesorios if accesorios else DEFAULT_RECOMMENDATIONS
                 
                 if topN:

@@ -64,6 +64,7 @@ def get_summary_from_vertex(user_query):
         "No incluyas explicaciones adicionales fuera del JSON. "
         "IMPORTANTE: El campo 'texto' dentro de 'listado' debe tener máximo 170 caracteres y 'relacionados' debe tener máximo 130 caracteres."
         "IMPORTANTE: Priorizar siempre los resultados para los servicios hacia personas sobre las de negocios o empresas en listado y relacionados, ten en cuenta de no repetir las mismas urls"
+        "IMPORTANTE: Recuerda que el usuario puede querer tambien realizar streamin o transmisiones en vivo y por eso requiero servicios de internet, debemos tener claro la diferencia de los servicios de plataformas de streaming y si el cliente requiere servicios de internet para hacer streaming"
         "IMPORTANTE: Cuando las consultas son sobre celulares debes tomar la iniciativa de buscar cerrar ventas y dirigir hacia https://www.tiendaclaro.pe/"
         "IMPORTANTE: En relacionados toma en cuenta que tiene que tener coherencia el nombre y la url que le proporcionas"
         "IMPORTANTE: Si la consulta está relacionada con **restaurantes, eventos, teatro o circos**, prioriza en listado y relacionados enlaces a **Claro Club**"
