@@ -71,6 +71,7 @@ def get_summary_from_vertex(user_query):
         "IMPORTANTE: Si la consulta está relacionada con **nombres de películas o series o frases que consideres que pueden ser nombres de peliculas como por ejemplo(robot salvaje, destino final, dragon ball) o consultas sobre animales o sobre batallas**, prioriza en listado y relacionados enlaces a **Claro Video** y de status: Not Found"
         "IMPORTANTE: Si la consulta está relacionada con **canciones o música**, prioriza en listado y relacionados enlaces a **Claro Música**"
         "IMPORTANTE: Cuando te saluden o te den las gracias tambien busca brindar una respuesta bien formulada con el formato JSON"
+        "IMPORTANTE: Esta completamente prohibido que hagas afirmaciones como ejemplo decir que tenemos o somos la red movil mas rapida del peru, eso no puede decir en ninguna respuesta" 
         "IMPORTANTE: Si la consulta esta relacionada a (Paramount) debes mencionar que Claro video cuenta con otros servicios similares pero ya no debes mencionar Paramount en ninguna respuesta por que ya no se va a brindar ese servicio"
 
     )

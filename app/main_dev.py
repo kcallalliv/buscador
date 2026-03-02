@@ -1317,6 +1317,13 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
         preferred_same_model = same_model
         if desired_variant is not None:
             preferred_same_model = [c for c in same_model if c.get("_variant") == desired_variant]
+            if preferred_same_model:
+                if any(c.get("_is_7990") for c in preferred_same_model):
+                    preferred_same_model = [c for c in preferred_same_model if c.get("_is_7990")]
+            else:
+                had_exact = False
+                candidates = [c for c in candidates if c.get("_model") != target_model]
+                same_model = []
         elif desired_variant is None:
             base_only = [c for c in same_model if c.get("_variant") == 0]
             if base_only:
@@ -1380,7 +1387,8 @@ def search_products_bq(nq: str, prioritize_plan_79: bool):
             return picked
 
         selected = _pick_colors(preferred_same_model, 5)
-        if len(selected) < 5:
+        allow_variant_fallback = desired_variant is None
+        if len(selected) < 5 and allow_variant_fallback:
             variants = [c for c in same_model if c not in selected]
             selected.extend(variants[:5 - len(selected)])
 
@@ -1556,7 +1564,8 @@ def search_brand_only_bq(nq_brand: str) -> List[dict]:
 
     dedupe_by_variant = brand_focus != "samsung"
     #picked, seen_keys, seen_pairs, seen_model_keys = [], set(), set(), set()
-    picked, seen_keys, seen_pairs, seen_model_keys, seen_titles = [], set(), set(), set(), set()
+    #picked, seen_keys, seen_pairs, seen_model_keys, seen_titles = [], set(), set(), set(), set()
+    picked, seen_keys, seen_pairs, seen_model_keys, seen_titles, seen_colors = [], set(), set(), set(), set(), set()
     for item in candidates:
         variant_key = item.get("_variant", 0) if dedupe_by_variant else 0
         model_key = item.get("_model_key") or ""
@@ -1570,6 +1579,8 @@ def search_brand_only_bq(nq_brand: str) -> List[dict]:
             continue
         if title_key and title_key in seen_titles:
             continue
+        if item["_color"] and item["_color"] in seen_colors:
+            continue
         if item["_color"] and (item["_model"], variant_key, item["_color"]) in seen_pairs:
             continue
         picked.append(item)
@@ -1577,6 +1588,7 @@ def search_brand_only_bq(nq_brand: str) -> List[dict]:
             seen_keys.add(key)
         if item["_color"]:
             seen_pairs.add((item["_model"], variant_key, item["_color"]))
+            seen_colors.add(item["_color"])
         if model_key:
             seen_model_keys.add(model_key)
         if title_key:
@@ -2475,7 +2487,7 @@ def query_dev():
         guardar_pregunta_en_historial(normalized_query, sia_id, respuesta, pregunta_timestamp, user_agent)
         respuesta["_meta"] = {"normalized_query": normalized_query, "category": category, "cache_hit": uso_cache}
 
-# ✅ FALLBACK A PELÍCULAS (ÚNICO PUNTO)
+# FALLBACK A PELÍCULAS (ÚNICO PUNTO)
         if category == "general" and respuesta:
             status = respuesta.get("status")
             is_not_found = status in ("NotFound", "Not Found")
@@ -2501,7 +2513,7 @@ def query_dev():
                     return jsonify(movies_hit)
 
 
-        # ✅ Si no hubo fallback, recién guardas el historial normal
+        # Si no hubo fallback, recién guardas el historial normal
         guardar_pregunta_en_historial(normalized_query, sia_id, respuesta, pregunta_timestamp, user_agent)
         return jsonify(respuesta)
 
